@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (if you have local CSVs you don't want to push)
+*.csv
+!Assignments_CSV.csv
+!Districts_CSV.csv
+!Charters_CSV.csv
+
+# Credentials
+credentials.json
+*.json
+!package.json
+
+# Archives
+Archive/
+archive/
+*.zip
+*.tar.gz
+
+# Logs
+*.log
