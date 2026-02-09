@@ -24,6 +24,14 @@ st.set_page_config(
 # Custom CSS - PED Brand Style Guide compliant
 st.markdown("""
     <style>
+        /* Force light mode */
+        @media (prefers-color-scheme: dark) {
+            .stApp {
+                background-color: #faf9f7;
+                color: #333333;
+            }
+        }
+        
         /* PED Brand Colors:
            Primary: #245d62 (teal-blue)
            Secondary: #c64c43 (coral-red), #f4784e (orange), #edc872 (gold), #fef0c3 (light yellow)
