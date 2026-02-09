@@ -1,0 +1,7 @@
+[theme]
+# --- NMPED Brand Palette ---
+primaryColor = "#245d62"            # Turquoise (main accent)
+backgroundColor = "#ffffff"         # White background
+secondaryBackgroundColor = "#fef0c3"  # Light yellow secondary panel
+textColor = "#000000"
+font = "sans serif"
