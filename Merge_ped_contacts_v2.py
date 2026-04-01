@@ -591,7 +591,7 @@ if search:
     str_cols = view.select_dtypes(include="object").columns
     mask = pd.Series(False, index=view.index)
     for c in str_cols:
-        mask |= view[c].astype(str).map(lambda x: unidecode(x).lower()).str.contains(q, na=False)
+        mask |= view[c].astype(str).map(lambda x: unidecode(str(x)).lower()).str.contains(q, na=False)
     view = view[mask]
 
 # ── Metrics row ──────────────────────────────────────────────────────
