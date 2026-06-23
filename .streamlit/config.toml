@@ -1,4 +1,4 @@
-toml[theme]
+[theme]
 # --- NMPED Brand Palette (institutional-clarity pass) ---
 primaryColor = "#245d62"              # Teal — widget accents: sliders, checkboxes, focus rings
 backgroundColor = "#ffffff"           # White main canvas
