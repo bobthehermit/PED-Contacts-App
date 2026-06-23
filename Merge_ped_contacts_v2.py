@@ -1,7 +1,11 @@
-# ped_contacts_v2.py — PED Contacts Manager (Streamlined)
+# Merge_ped_contacts_v2.py — PED Contacts Manager (Streamlined)
 # Merges analyst assignments with district/charter contact sheets.
 # Charter matching uses fuzzy name matching (no PED# in charter sheet).
 # Districts match on PED_NO directly.
+#
+# Design pass (Jun 2026): de-emojified, restyled to "institutional clarity"
+#   — teal as the structural accent, gold as hairline dividers, coral
+#   reserved strictly for the unmatched/alert state. Logic unchanged.
 
 import re, os, base64, urllib.parse
 from datetime import datetime
@@ -22,62 +26,74 @@ st.set_page_config(
 )
 
 # ─── Brand CSS ───────────────────────────────────────────────────────
-# PED brand palette
-#   Primary teal:  #245d62   Dark teal: #1a474b
-#   Coral red:     #c64c43   Orange:    #f4784e
-#   Gold:          #edc872   Lt yellow: #fef0c3
+# NMPED palette
+#   Primary teal: #245d62   Dark teal: #1a474b
+#   Gold:         #edc872   Coral:     #c64c43
+#   (Light yellow #fef0c3 intentionally retired from panels.)
 st.markdown("""
 <style>
-/* Layout */
-.block-container { padding-top: .8rem !important; }
-
-/* Metrics */
-.stMetric {
-    background: #fef0c3; padding: 14px; border-radius: 6px;
-    border-left: 4px solid #245d62;
-}
-.stMetric label { color: #245d62 !important; font-weight: 600; font-size: .85rem; }
-.stMetric [data-testid="stMetricValue"] {
-    color: #245d62 !important; font-weight: 700; font-size: 1.7rem;
-}
+/* Layout — a comfortable max width reads more intentional than full-bleed.
+   Delete the max-width line to go back to edge-to-edge wide mode. */
+.block-container { padding-top: 1.1rem !important; max-width: 1180px; }
 
 /* Headings */
-h1, h2, h3 { color: #245d62; }
+h1, h2, h3, h4 { color: #245d62; font-weight: 600; }
 
-/* Contact card */
-.contact-card {
-    background: #fef0c3; padding: 18px; border-radius: 8px;
-    margin: 8px 0; border-left: 5px solid #245d62; color: #333;
+/* Custom masthead */
+.ped-eyebrow {
+    font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+    color: #7a8a86; font-weight: 600;
 }
-.contact-section {
-    margin: 12px 0; padding: 10px 0;
-    border-bottom: 1px solid #edc872;
+.ped-title {
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 2rem; color: #245d62; font-weight: 600;
+    margin: .15rem 0 .6rem; line-height: 1.1;
 }
-.contact-section:last-child { border-bottom: none; }
+.ped-rule { display: flex; height: 3px; margin-bottom: 1.3rem; }
+.ped-rule .g { width: 46px; background: #edc872; }
+.ped-rule .t { flex: 1; background: #245d62; }
+
+/* Section label inside contact cards — gold hairline */
+.section-label {
+    font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+    color: #245d62; font-weight: 600;
+    padding-bottom: 6px; border-bottom: 1px solid #edc872;
+    margin: 16px 0 10px;
+}
+
+/* Status pills + badges */
+.pill { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px; }
+.pill-matched   { color: #1a474b; background: #e1efe9; }
+.pill-unmatched { color: #993c1d; background: #faece7; }
+.badge {
+    font-size: 12px; color: #5f5e5a; background: #f1efe8;
+    padding: 3px 9px; border-radius: 6px;
+}
+
+/* Links — teal, not coral (coral is reserved for alerts) */
+a { color: #245d62; text-decoration: none; }
+a:hover { color: #1a474b; text-decoration: underline; }
 
 /* Download buttons */
 .stDownloadButton button {
-    width: 100%; background: #245d62; color: #fff !important;
+    width: 100%; background: #245d62; color: #fff !important; border: none;
 }
 .stDownloadButton button:hover { background: #1a474b; }
 .stDownloadButton button p,
-.stDownloadButton button span,
-.stDownloadButton button:hover p,
-.stDownloadButton button:hover span { color: #fff !important; }
+.stDownloadButton button span { color: #fff !important; }
 
-/* Sidebar tags */
+/* Sidebar multiselect tags */
 [data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] {
-    background: #245d62 !important; color: #fff !important;
+    background: #245d62 !important;
 }
 [data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] span { color: #fff !important; }
 [data-testid="stSidebar"] .stMultiSelect [data-baseweb="tag"] svg  { fill: #fff !important; }
 
-/* Links */
-a { color: #c64c43; text-decoration: none; }
-a:hover { color: #a03d35; text-decoration: underline; }
+/* Expander — lighter frame */
+[data-testid="stExpander"] { border: 0.5px solid #ececec; border-radius: 8px; }
 
 /* Pagination buttons */
-.pagination-row button { min-width: 42px; }
+.pagination-row button { min-width: 52px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -282,7 +298,7 @@ def _prep_charters(df: pd.DataFrame) -> pd.DataFrame:
 def merge_all(assign, districts, charters, overrides=None,
               token_cut=92, partial_cut=96, strict=False):
     """Return (merged_df, match_log_df).
-    
+
     Overrides are applied first: charter names in the overrides table
     are matched by exact CHARTER_NAME → PED_NO, skipping fuzzy logic.
     Remaining charters fall through to fuzzy matching as before.
@@ -391,9 +407,9 @@ def merge_all(assign, districts, charters, overrides=None,
 # DISPLAY HELPERS
 # ═════════════════════════════════════════════════════════════════════
 
-def _contact_block(label: str, icon: str, fields: list[tuple[str, str]]):
-    """Render a labelled contact section."""
-    st.markdown(f"**{icon} {label}**")
+def _contact_block(label: str, fields: list[tuple[str, str]]):
+    """Render a labelled contact section (uppercase label + gold hairline)."""
+    st.markdown(f'<div class="section-label">{label}</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     half = len(fields) // 2 + len(fields) % 2
     for idx, (k, v) in enumerate(fields):
@@ -409,26 +425,29 @@ def display_contact(row: pd.Series):
     """Render a full contact card for one LEA."""
     lea_type = _clean(row.get("LEA_TYPE", "")).upper()
     charter = lea_type in {"SC", "LC"}
+    matched = bool(row.get("Matched", False))
+    type_label = "Charter" if charter else "District"
 
-    # Header row
-    c1, c2, c3 = st.columns([2, 1, 1])
-    with c1:
-        st.markdown(f"### {_clean(row.get('LEA_NAME', 'N/A'))}")
-    with c2:
-        st.metric("PED #", _clean(row.get("PED_NO", "N/A")))
-    with c3:
-        st.metric("Type", "Charter" if charter else "District")
+    pill = ('<span class="pill pill-matched">Matched</span>' if matched
+            else '<span class="pill pill-unmatched">Unmatched</span>')
 
-    st.markdown("---")
+    # Header: name + PED / type / status badges
+    st.markdown(
+        f'<div style="font-size:1.3rem;font-weight:600;color:#222;">'
+        f'{_clean(row.get("LEA_NAME", "N/A"))}</div>'
+        f'<div style="display:flex;gap:8px;align-items:center;margin:10px 0 4px;">'
+        f'<span class="badge" style="font-family:monospace;">{_clean(row.get("PED_NO", "N/A"))}</span>'
+        f'<span class="badge">{type_label}</span>{pill}</div>',
+        unsafe_allow_html=True,
+    )
 
     # Analyst
-    _contact_block("Budget Analyst", "📊", [
+    _contact_block("Budget Analyst", [
         ("Name",       _clean(row.get("Analyst", "N/A"))),
         ("Email",      _clean(row.get("Analyst Email", "N/A"))),
         ("Supervisor", _clean(row.get("Analyst Reports To", "N/A"))),
         ("Phone",      _clean(row.get("Analyst Phone", "N/A"))),
     ])
-    st.markdown("---")
 
     if charter:
         # Rep
@@ -437,14 +456,13 @@ def display_contact(row: pd.Series):
             _clean(row.get("CHARTER REP FIRST NAME", "")),
             _clean(row.get("CHARTER REP LAST NAME", "")),
         ])) or "N/A"
-        _contact_block("Charter Representative", "👤", [
+        _contact_block("Charter Representative", [
             ("Name",  rep_name),
             ("Title", _clean(row.get("CHARTER REP TITLE", "N/A"))),
             ("Phone", _clean(row.get("REPRESENTATIVE CONTACT PHONE #", ""))
                       or _clean(row.get("PHONE", "N/A"))),
             ("Email", _clean(row.get("REPRESENTATIVE EMAIL", "N/A"))),
         ])
-        st.markdown("---")
 
         # Fiscal
         fisc_name = " ".join(filter(None, [
@@ -452,7 +470,7 @@ def display_contact(row: pd.Series):
             _clean(row.get("FISCAL CONTACT FIRST NAME", "")),
             _clean(row.get("FISCAL CONTACT LAST NAME", "")),
         ])) or "N/A"
-        _contact_block("Fiscal Contact", "💰", [
+        _contact_block("Fiscal Contact", [
             ("Name",  fisc_name),
             ("Title", _clean(row.get("CONTACT TITLE", "N/A"))),
             ("Phone", _clean(row.get("FISCAL CONTACT PHONE #", "N/A"))),
@@ -465,13 +483,12 @@ def display_contact(row: pd.Series):
             _clean(row.get("SUPT. FIRST & M.I.", "")),
             _clean(row.get("SUPT. LAST NAME", "")),
         ])) or "N/A"
-        _contact_block("Superintendent", "👤", [
+        _contact_block("Superintendent", [
             ("Name",  supt_name),
             ("Title", _clean(row.get("SUPT. TITLE", "N/A"))),
             ("Phone", _clean(row.get("SUPT. PHONE", "N/A"))),
             ("Email", _clean(row.get("SUPT. E-MAIL", "N/A"))),
         ])
-        st.markdown("---")
 
         # Business Manager
         bm_name = " ".join(filter(None, [
@@ -479,7 +496,7 @@ def display_contact(row: pd.Series):
             _clean(row.get("BUS. MGR. FIRST & M. I.", "")),
             _clean(row.get("BUS. MGR. LAST NAME", "")),
         ])) or "N/A"
-        _contact_block("Business Manager", "💰", [
+        _contact_block("Business Manager", [
             ("Name",  bm_name),
             ("Title", _clean(row.get("BUS. MGR. TITLE", "N/A"))),
             ("Phone", _clean(row.get("BUS. MGR. PHONE", "N/A"))),
@@ -498,8 +515,7 @@ def display_contact(row: pd.Series):
     if csz.strip():
         parts.append(csz.strip())
     if parts:
-        st.markdown("---")
-        st.markdown("**📍 Address**")
+        st.markdown('<div class="section-label">Address</div>', unsafe_allow_html=True)
         st.write("  \n".join(parts))
 
 
@@ -521,25 +537,48 @@ def _collect_emails(df: pd.DataFrame) -> list[str]:
     return sorted(emails)
 
 
+def _metric_card(label: str, value, alert: bool = False) -> str:
+    """Return HTML for one summary metric card. Coral accent when alert."""
+    if alert:
+        border = "border:0.5px solid #ecc9c1;border-left:3px solid #c64c43;"
+        lab_color, val_color = "#a8584c", "#c64c43"
+    else:
+        border = "border:0.5px solid #e3e3dd;"
+        lab_color, val_color = "#8a8a82", "#245d62"
+    return (
+        f'<div style="{border}border-radius:8px;padding:13px 15px;">'
+        f'<div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;'
+        f'color:{lab_color};">{label}</div>'
+        f'<div style="font-size:1.7rem;font-weight:600;color:{val_color};">{value}</div>'
+        f'</div>'
+    )
+
+
 # ═════════════════════════════════════════════════════════════════════
 # MAIN APP
 # ═════════════════════════════════════════════════════════════════════
 
-st.title("🏫 PED Contacts Manager")
+# Masthead (replaces st.title)
+st.markdown(
+    '<div class="ped-eyebrow">New Mexico PED · School Budget Bureau</div>'
+    '<div class="ped-title">PED Contacts Manager</div>'
+    '<div class="ped-rule"><span class="g"></span><span class="t"></span></div>',
+    unsafe_allow_html=True,
+)
 
 # ── Sidebar: data loading & filters ─────────────────────────────────
 st.sidebar.header("Data")
 
-if st.sidebar.button("🔄 Refresh Data"):
+if st.sidebar.button("Refresh data"):
     st.cache_data.clear()
     st.rerun()
 
 try:
     with st.spinner("Loading from Google Sheets…"):
         raw_assign, raw_dist, raw_chart, raw_overrides, refresh_ts = _fetch_sheets()
-    st.sidebar.success(f"✅ Loaded — {refresh_ts}")
+    st.sidebar.success(f"Loaded — {refresh_ts}")
     if len(raw_overrides) > 0:
-        st.sidebar.caption(f"📌 {len(raw_overrides)} charter override(s) active")
+        st.sidebar.caption(f"{len(raw_overrides)} charter override(s) active")
 except Exception as e:
     st.error(f"Failed to load data: {e}")
     st.stop()
@@ -549,7 +588,7 @@ assign  = _prep_assignments(raw_assign.copy())
 dists   = _prep_districts(raw_dist.copy())
 charts  = _prep_charters(raw_chart.copy())
 
-with st.sidebar.expander("⚙️ Charter Matching", expanded=False):
+with st.sidebar.expander("Charter matching", expanded=False):
     token_cut  = st.slider("Token-set threshold", 80, 100, 92)
     partial_cut = st.slider("Partial threshold",   90, 100, 96)
     strict     = st.checkbox("Exact matches only")
@@ -571,6 +610,8 @@ lea_type_opt = st.sidebar.radio(
 )
 
 if st.sidebar.button("Reset filters"):
+    for k in ("Analyst", "Supervisor"):
+        st.session_state.pop(k, None)
     st.rerun()
 
 # Apply filters
@@ -585,7 +626,7 @@ elif lea_type_opt == "Charters only":
     view = view[view["LEA_TYPE"].apply(_is_charter)]
 
 # ── Search ───────────────────────────────────────────────────────────
-search = st.text_input("🔎 Search", placeholder="Name, PED#, email, city…")
+search = st.text_input("Search", placeholder="Name, PED #, email, city…")
 if search:
     q = unidecode(search).lower()
     str_cols = view.select_dtypes(include="object").columns
@@ -595,11 +636,14 @@ if search:
     view = view[mask]
 
 # ── Metrics row ──────────────────────────────────────────────────────
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total LEAs", len(merged))
-c2.metric("Showing", len(view))
-c3.metric("✅ Matched", int(view["Matched"].sum()))
-c4.metric("❌ Unmatched", int((~view["Matched"]).sum()))
+unmatched_n = int((~view["Matched"]).sum())
+m1, m2, m3, m4 = st.columns(4)
+m1.markdown(_metric_card("Total LEAs", len(merged)), unsafe_allow_html=True)
+m2.markdown(_metric_card("Showing", len(view)), unsafe_allow_html=True)
+m3.markdown(_metric_card("Matched", int(view["Matched"].sum())), unsafe_allow_html=True)
+m4.markdown(_metric_card("Unmatched", unmatched_n, alert=unmatched_n > 0),
+            unsafe_allow_html=True)
+st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
 
 # ═════════════════════════════════════════════════════════════════════
 # PAGINATED CONTACT BROWSER
@@ -629,14 +673,17 @@ else:
 
     st.markdown(f"#### Contacts ({start+1}–{end} of {len(summary)})")
 
-    # Render clickable table
+    # Render clickable rows. Streamlit expander labels accept markdown
+    # color syntax (:green[]/:red[]) but not custom hex, so the list uses
+    # green/red while the expanded card uses exact brand teal/coral pills.
     for real_idx, srow in page_df.iterrows():
-        matched_icon = "✅" if srow.get("Matched", False) else "❌"
+        matched = bool(srow.get("Matched", False))
+        status = ":green[Matched]" if matched else ":red[Unmatched]"
         lea_type_label = "Charter" if _clean(srow.get("LEA_TYPE","")).upper() in {"SC","LC"} else "District"
         label = (
-            f"{matched_icon} **{_clean(srow.get('PED_NO',''))}** — "
-            f"{_clean(srow.get('LEA_NAME',''))}  "
-            f"({lea_type_label} · {_clean(srow.get('Analyst',''))})"
+            f"{status}  **{_clean(srow.get('PED_NO',''))}** — "
+            f"{_clean(srow.get('LEA_NAME',''))}  ·  "
+            f"{lea_type_label} · {_clean(srow.get('Analyst',''))}"
         )
         with st.expander(label, expanded=False):
             display_contact(view.loc[real_idx])
@@ -644,25 +691,25 @@ else:
     # Pagination controls
     pcol1, pcol2, pcol3, pcol4, pcol5 = st.columns([1, 1, 2, 1, 1])
     with pcol1:
-        if st.button("⏮", disabled=(page == 0), key="pg_first"):
+        if st.button("First", disabled=(page == 0), key="pg_first"):
             st.session_state.page = 0
             st.rerun()
     with pcol2:
-        if st.button("◀", disabled=(page == 0), key="pg_prev"):
+        if st.button("‹ Prev", disabled=(page == 0), key="pg_prev"):
             st.session_state.page = page - 1
             st.rerun()
     with pcol3:
         st.markdown(
-            f"<div style='text-align:center;padding-top:6px'>"
+            f"<div style='text-align:center;padding-top:6px;color:#8a8a82'>"
             f"Page {page+1} of {total_pages}</div>",
             unsafe_allow_html=True,
         )
     with pcol4:
-        if st.button("▶", disabled=(page >= total_pages - 1), key="pg_next"):
+        if st.button("Next ›", disabled=(page >= total_pages - 1), key="pg_next"):
             st.session_state.page = page + 1
             st.rerun()
     with pcol5:
-        if st.button("⏭", disabled=(page >= total_pages - 1), key="pg_last"):
+        if st.button("Last", disabled=(page >= total_pages - 1), key="pg_last"):
             st.session_state.page = total_pages - 1
             st.rerun()
 
@@ -671,7 +718,7 @@ else:
 # BATCH EMAIL
 # ═════════════════════════════════════════════════════════════════════
 
-with st.expander("📧 Batch Email", expanded=False):
+with st.expander("Batch email", expanded=False):
     email_mode = st.radio(
         "Recipients:",
         ["Current filtered view", "Specific LEAs", "By analyst"],
@@ -709,23 +756,23 @@ with st.expander("📧 Batch Email", expanded=False):
 # DATA TABLE & DOWNLOADS
 # ═════════════════════════════════════════════════════════════════════
 
-with st.expander("📊 Data Table", expanded=False):
+with st.expander("Data table", expanded=False):
     show_cols = [c for c in [
         "PED_NO", "LEA_NAME", "LEA_TYPE", "Analyst",
         "Analyst Reports To", "Matched", "match_method", "match_score"
     ] if c in view.columns]
     st.dataframe(view[show_cols], use_container_width=True, height=400)
 
-st.subheader("💾 Downloads")
+st.subheader("Downloads")
 dl1, dl2, dl3 = st.columns(3)
 with dl1:
-    st.download_button("⬇️ Filtered", view.to_csv(index=False).encode("utf-8-sig"),
+    st.download_button("Filtered", view.to_csv(index=False).encode("utf-8-sig"),
                        "filtered_contacts.csv", "text/csv")
 with dl2:
-    st.download_button("⬇️ All", merged.to_csv(index=False).encode("utf-8-sig"),
+    st.download_button("All contacts", merged.to_csv(index=False).encode("utf-8-sig"),
                        "all_contacts.csv", "text/csv")
 with dl3:
-    st.download_button("⬇️ Match Log", match_log.to_csv(index=False).encode("utf-8-sig"),
+    st.download_button("Match log", match_log.to_csv(index=False).encode("utf-8-sig"),
                        "match_log.csv", "text/csv")
 
 # Footer

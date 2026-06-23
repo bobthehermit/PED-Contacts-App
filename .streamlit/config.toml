@@ -1,7 +1,7 @@
-[theme]
-# --- NMPED Brand Palette ---
-primaryColor = "#245d62"            # Turquoise (main accent)
-backgroundColor = "#ffffff"         # White background
-secondaryBackgroundColor = "#fef0c3"  # Light yellow secondary panel
-textColor = "#000000"
+toml[theme]
+# --- NMPED Brand Palette (institutional-clarity pass) ---
+primaryColor = "#245d62"              # Teal — widget accents: sliders, checkboxes, focus rings
+backgroundColor = "#ffffff"           # White main canvas
+secondaryBackgroundColor = "#f4f3ef"  # whisper of brand warmth
+textColor = "#1a1a1a"                 # Near-black — softer, more designed than pure #000
 font = "sans serif"
