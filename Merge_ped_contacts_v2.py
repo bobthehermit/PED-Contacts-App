@@ -6,6 +6,13 @@
 # Design pass (Jun 2026): de-emojified, restyled to "institutional clarity"
 #   — teal as the structural accent, gold as hairline dividers, coral
 #   reserved strictly for the unmatched/alert state. Logic unchanged.
+#
+# Patch (Jul 2026): the assignments sheet's "Analyst Reports To" header was
+#   renamed to "Analyst Manager" upstream (with two new sibling columns,
+#   "Analyst Manager Email" / "Analyst Manager Phone"), which crashed the
+#   app with a KeyError. _prep_assignments() now resolves analyst-related
+#   headers the same fuzzy way PED_NO/LEA_TYPE/LEA_NAME already were,
+#   instead of requiring an exact literal match.
 
 import re, os, base64, urllib.parse
 from datetime import datetime
@@ -259,16 +266,55 @@ def _find_col(df: pd.DataFrame, candidates: list[str]):
 
 def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
     renames = {
-        "PED_NO":   ["PED NO", "ped no", "PED_NO", "Ped No"],
-        "LEA_TYPE":  ["DISTRICT, STATE, OR LOCAL CHARTER", "LEA TYPE", "LEA", "TYPE"],
-        "LEA_NAME":  ["DISTRICT/CHARTER NAME", "LEA NAME", "NAME"],
+        "PED_NO":     ["PED NO", "ped no", "PED_NO", "Ped No"],
+        "LEA_TYPE":   ["DISTRICT, STATE, OR LOCAL CHARTER", "LEA TYPE", "LEA", "TYPE"],
+        "LEA_NAME":   ["DISTRICT/CHARTER NAME", "LEA NAME", "NAME"],
+        # Same fuzzy-header treatment for the analyst fields, since these
+        # were previously assumed to match verbatim and broke the app the
+        # moment the source sheet's header text shifted at all.
+        "Analyst":            ["Analyst", "Budget Analyst", "ANALYST"],
+        "Analyst Email":      ["Analyst Email", "Analyst E-mail", "ANALYST EMAIL"],
+        # CONFIRMED via screenshot of the live sheet (Jul 2026): the header
+        # was renamed from "Analyst Reports To" -> "Analyst Manager", with
+        # two new sibling columns added alongside it (captured below but
+        # not yet surfaced in the UI — see note near display_contact()).
+        "Analyst Reports To": ["Analyst Reports To", "Analyst Manager", "Reports To",
+                                "Supervisor", "Analyst Supervisor", "ANALYST REPORTS TO",
+                                "ANALYST MANAGER"],
+        "Analyst Phone":      ["Analyst Phone", "ANALYST PHONE"],
+        "Analyst Manager Email": ["Analyst Manager Email", "ANALYST MANAGER EMAIL"],
+        "Analyst Manager Phone": ["Analyst Manager Phone", "ANALYST MANAGER PHONE"],
     }
     for canon, cands in renames.items():
         col = _find_col(df, cands)
         if col:
             df = df.rename(columns={col: canon})
-    df["PED_NO"]       = df["PED_NO"].apply(ped_canonical)
-    df["LEA_TYPE"]     = df["LEA_TYPE"].str.strip().str.upper()
+
+    # Fail loudly and usefully instead of a bare KeyError three screens away.
+    required = ["PED_NO", "LEA_TYPE", "LEA_NAME"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(
+            f"_prep_assignments: could not find required column(s) {missing} "
+            f"in the assignments sheet. Raw columns present: {df.columns.tolist()}"
+        )
+
+    # Analyst fields are used downstream (filters, contact cards) but aren't
+    # strictly required to build PED_NO/LEA_TYPE/LEA_NAME — so instead of
+    # crashing, backfill with empty strings and surface a warning in the app
+    # if the source sheet drops/renames one of them again in the future.
+    for optional_col in ["Analyst", "Analyst Email", "Analyst Reports To",
+                          "Analyst Phone", "Analyst Manager Email", "Analyst Manager Phone"]:
+        if optional_col not in df.columns:
+            st.sidebar.warning(
+                f"⚠️ Column '{optional_col}' not found in assignments sheet — "
+                f"filters/cards using it will show blanks. "
+                f"Raw columns: {df.columns.tolist()}"
+            )
+            df[optional_col] = ""
+
+    df["PED_NO"]        = df["PED_NO"].apply(ped_canonical)
+    df["LEA_TYPE"]      = df["LEA_TYPE"].str.strip().str.upper()
     df["LEA_NAME_NORM"] = df["LEA_NAME"].apply(normalize_name)
     return df
 
@@ -442,6 +488,10 @@ def display_contact(row: pd.Series):
     )
 
     # Analyst
+    # NOTE: "Analyst Manager Email" / "Analyst Manager Phone" are now
+    # available from the sheet (added alongside the "Analyst Manager"
+    # rename) but aren't shown here yet — say the word and I'll add them
+    # as extra fields in this block.
     _contact_block("Budget Analyst", [
         ("Name",       _clean(row.get("Analyst", "N/A"))),
         ("Email",      _clean(row.get("Analyst Email", "N/A"))),
