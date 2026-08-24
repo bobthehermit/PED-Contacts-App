@@ -74,17 +74,41 @@ cache and re-pull.
 Each charter row is resolved in this order, stopping at the first hit:
 
 1. **Override** — the name appears in the overrides sheet. Skips everything else.
-2. **Exact** — normalised name (or a variant) maps to exactly one PED number.
-3. **Squash** — normalised names match once all spacing is removed. Rescues
+2. **Exact / light** — lightly-normalised name maps to exactly one PED number.
+3. **Squash / light** — as above, once all spacing is removed. Rescues
    spacing-only differences like `Alma d'Arte` vs `Alma d' arte`.
-4. **Fuzzy** — `token_set_ratio`, then `partial_ratio`, above their thresholds.
+4. **Exact / heavy** — heavily-normalised name (or a variant) maps to one PED.
+5. **Squash / heavy**.
+6. **Fuzzy** — `token_set_ratio` then `partial_ratio`, light form first.
 
 Anything unresolved is written to the **Charter match log** with a reason.
 
-### Name normalisation
+### Two-pass normalisation — and why the order matters
 
-CSD keeps editorial notes inside the school-name column, so normalisation strips
-them before matching:
+`normalize_light()` handles case, diacritics, punctuation, articles, and CSD's
+editorial notes. `normalize_name()` additionally strips boilerplate words:
+*public, charter, school, academy, district, high, prep, learning, center…*
+
+The heavy pass is what lets `(The) ASK Academy` meet `ASK Academy (The)`. But it
+also dissolves the only token separating sibling campuses:
+
+| Roster names | Heavy form |
+|---|---|
+| South Valley Academy / South Valley Preparatory School | `south valley` |
+| Taos Academy / Taos Charter School | `taos` |
+| Albuquerque Charter Academy | `albuquerque` |
+
+Two distinct schools sharing a key means one silently steals the other's match —
+`Albuquerque Charter Academy` collapsing to bare `albuquerque` was swallowing
+`Albuquerque Institute of Mathematics and Science at UNM`. **Matching runs on the
+light form first for exactly this reason**, and falls back to the heavy form only
+for genuinely divergent spellings. Preserve that ordering.
+
+The sidebar **Roster collisions** panel lists roster entries that collapse onto a
+shared heavy key, so these can be spotted before they cause a bad match.
+
+CSD also keeps editorial notes inside the school-name column, which both passes
+strip before matching:
 
 - `(formerly known as X)`, `(CLOSED)`, `(opening 2025-26)` — note-parentheticals removed
 - `(The) ASK Academy` vs `ASK Academy (The)` — parens dropped, articles removed
@@ -186,6 +210,16 @@ header resolves despite drifted text, the Data sources panel notes what bound to
 **A school matched to the wrong campus**
 Check the match log for its match method. Add it to the overrides sheet — that's
 faster and safer than adjusting thresholds, which affects every school.
+
+**"duplicate — 5XX-XXX was already claimed by 'Other School'"**
+Two source rows resolved to one PED number. The named winner tells you which.
+Usually either the roster is missing the loser entirely, or the two schools share
+a heavy-normalised key (check the Roster collisions panel).
+
+**An acronym won't match its expansion**
+No amount of normalisation bridges `AIMS @ UNM` to `Albuquerque Institute of
+Mathematics and Science at UNM`. That is precisely what the overrides sheet is
+for — add the CSD spelling and the PED number.
 
 **A school won't match at all**
 Look up its reason in the match log. `below threshold` usually means a

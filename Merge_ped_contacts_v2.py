@@ -223,7 +223,17 @@ _KNOWN_RENAMES = {
         "northpoint charter school",
 }
 
-def normalize_name(name: str) -> str:
+def normalize_light(name: str) -> str:
+    """Punctuation, case, diacritics, articles, and CSD's editorial notes —
+    but the words are left alone.
+
+    'South Valley Academy' and 'South Valley Preparatory School' stay distinct
+    here. That matters: the heavy pass below strips 'academy', 'charter',
+    'school' and 'preparatory' as boilerplate, which is what lets
+    '(The) ASK Academy' meet 'ASK Academy (The)' — but it also dissolves the
+    only token separating sibling campuses, collapsing both South Valley
+    schools onto 'south valley'. Match on this form first.
+    """
     if pd.isna(name) or str(name).strip() == "":
         return ""
     s = unidecode(str(name)).lower()
@@ -233,8 +243,18 @@ def normalize_name(name: str) -> str:
     s = _STATUS_WORDS.sub(" ", s)            # bare "CLOSED" with no parens
     s = re.sub(r"[\u2010-\u2015]", " ", s)   # en/em dashes → space
     s = re.sub(r"['\u2018\u2019`]", "", s)   # d'Arte → dArte
-    s = re.sub(r"[-/.,&:;#]+", " ", s)
+    s = re.sub(r"[-/.,&:;#@]+", " ", s)
     s = _ARTICLES.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def normalize_name(name: str) -> str:
+    """Heavy pass — light, plus boilerplate removal. High recall, low
+    precision: use it only after normalize_light() has had its turn."""
+    s = normalize_light(name)
+    if not s:
+        return ""
     s = _SUFFIXES.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return _KNOWN_RENAMES.get(s, s)
@@ -491,7 +511,8 @@ def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
 
     df["PED_NO"]        = df["PED_NO"].apply(ped_canonical)
     df["LEA_TYPE"]      = df["LEA_TYPE"].str.strip().str.upper()
-    df["LEA_NAME_NORM"] = df["LEA_NAME"].apply(normalize_name)
+    df["LEA_NAME_LIGHT"] = df["LEA_NAME"].apply(normalize_light)
+    df["LEA_NAME_NORM"]  = df["LEA_NAME"].apply(normalize_name)
     return df
 
 
@@ -567,7 +588,8 @@ def _prep_charter_directory(df: pd.DataFrame) -> pd.DataFrame:
     df = _collapse_merged_rows(df, "CH_NAME")
     df = df[df["CH_NAME"].apply(_clean).ne("")]
     df["CH_STATUS"]    = df["CH_NAME"].apply(charter_status)
-    df["CH_NAME_NORM"] = df["CH_NAME"].apply(normalize_name)
+    df["CH_NAME_LIGHT"] = df["CH_NAME"].apply(normalize_light)
+    df["CH_NAME_NORM"]  = df["CH_NAME"].apply(normalize_name)
     if "CH_ADMIN_EMAIL" in df.columns:
         df["CH_ADMIN_EMAIL"] = df["CH_ADMIN_EMAIL"].apply(_valid_email)
     return df.reset_index(drop=True)
@@ -606,7 +628,8 @@ def _prep_charter_busmgr(df: pd.DataFrame) -> pd.DataFrame:
 
     df = _collapse_merged_rows(df, "BM_SCHOOL")
     df = df[df["BM_SCHOOL"].apply(_clean).ne("")]
-    df["BM_NAME_NORM"] = df["BM_SCHOOL"].apply(normalize_name)
+    df["BM_NAME_LIGHT"] = df["BM_SCHOOL"].apply(normalize_light)
+    df["BM_NAME_NORM"]  = df["BM_SCHOOL"].apply(normalize_name)
     if "BM_EMAIL" in df.columns:
         df["BM_EMAIL"] = df["BM_EMAIL"].apply(_valid_email)
     return df.reset_index(drop=True)
@@ -617,70 +640,127 @@ def _prep_charter_busmgr(df: pd.DataFrame) -> pd.DataFrame:
 # ═════════════════════════════════════════════════════════════════════
 
 def _build_roster_index(assign_c: pd.DataFrame):
-    """normalised-name → {PED_NO}, plus a squashed-key index."""
-    norm_to_ped: dict[str, set[str]] = {}
-    squash_to_ped: dict[str, set[str]] = {}
-    for _, r in assign_c[["PED_NO", "LEA_NAME_NORM"]].drop_duplicates().iterrows():
-        ped, n = r["PED_NO"], r["LEA_NAME_NORM"]
-        if not n or not ped:
+    """Index the roster on both passes.
+
+    Returns (light, heavy, squash_light, squash_heavy, display) where each of
+    the first four maps a normalised key to a set of PED numbers, and display
+    maps a key back to the roster names that produced it — so an ambiguous
+    match can be reported with names a person recognises, not just codes.
+    """
+    light: dict[str, set[str]] = {}
+    heavy: dict[str, set[str]] = {}
+    sq_light: dict[str, set[str]] = {}
+    sq_heavy: dict[str, set[str]] = {}
+    display: dict[str, set[str]] = {}
+    cols = ["PED_NO", "LEA_NAME", "LEA_NAME_LIGHT", "LEA_NAME_NORM"]
+    for _, r in assign_c[cols].drop_duplicates().iterrows():
+        ped, disp = r["PED_NO"], r["LEA_NAME"]
+        if not ped:
             continue
-        for v in _name_variants(n):
-            norm_to_ped.setdefault(v, set()).add(ped)
-            squash_to_ped.setdefault(_squash(v), set()).add(ped)
-    return norm_to_ped, squash_to_ped
+        lt, hv = r["LEA_NAME_LIGHT"], r["LEA_NAME_NORM"]
+        if lt:
+            light.setdefault(lt, set()).add(ped)
+            sq_light.setdefault(_squash(lt), set()).add(ped)
+            display.setdefault(lt, set()).add(disp)
+        for v in _name_variants(hv):
+            heavy.setdefault(v, set()).add(ped)
+            sq_heavy.setdefault(_squash(v), set()).add(ped)
+            display.setdefault(v, set()).add(disp)
+    return light, heavy, sq_light, sq_heavy, display
 
 
-def _match_source(src, raw_col, norm_col, norm_to_ped, squash_to_ped,
+def _roster_collisions(assign_c: pd.DataFrame) -> pd.DataFrame:
+    """Roster entries that the heavy pass collapses onto one key.
+
+    These are the entries most likely to steal or block a match, so they are
+    surfaced in the UI rather than left to be inferred from the match log.
+    """
+    if assign_c.empty:
+        return pd.DataFrame(columns=["key", "schools"])
+    g = (assign_c[assign_c["LEA_NAME_NORM"].ne("")]
+         .groupby("LEA_NAME_NORM")
+         .agg(schools=("LEA_NAME", lambda s: " | ".join(sorted(set(s)))),
+              n=("LEA_NAME", "nunique"))
+         .reset_index())
+    out = g[g["n"] > 1].rename(columns={"LEA_NAME_NORM": "key"})
+    return out[["key", "schools"]].sort_values("key")
+
+
+def _match_source(src, raw_col, light_col, norm_col, idx,
                   override_map, token_cut, partial_cut, strict, source_label):
     """Match one charter tab against the assignments roster.
 
-    Tiers: override → exact/variant → squashed → fuzzy (tie-guarded).
-    Every row produces a log entry, matched or not, with the reason.
+    Tier order is precision-first: override → exact/light → squash/light →
+    exact/heavy → squash/heavy → fuzzy/light → fuzzy/heavy. The light pass
+    runs first because it keeps sibling campuses apart; the heavy pass is the
+    recall net for genuinely divergent spellings.
     """
-    choices = [n for n in norm_to_ped if n]
+    light, heavy, sq_light, sq_heavy, display = idx
+    light_choices = [n for n in light if n]
+    heavy_choices = [n for n in heavy if n]
+
+    def _describe(keys):
+        names = set()
+        for k in keys:
+            names |= display.get(k, {k})
+        return "; ".join(sorted(names)[:4])
+
     rows = []
     for i, r in src.reset_index(drop=True).iterrows():
-        raw  = _clean(r.get(raw_col, ""))
-        norm = _clean(r.get(norm_col, ""))
-        if not raw and not norm:
+        raw = _clean(r.get(raw_col, ""))
+        lt  = _clean(r.get(light_col, ""))
+        hv  = _clean(r.get(norm_col, ""))
+        if not raw and not lt and not hv:
             continue
 
         chosen, method, score, reason = None, "", 0, ""
 
-        ped = override_map.get(normalize_name(raw)) or override_map.get(raw.lower())
+        ped = (override_map.get(lt) or override_map.get(hv)
+               or override_map.get(raw.lower()))
         if ped:
             chosen, method, score = ped, "override", 100
         else:
-            cands: set[str] = set()
-            for v in _name_variants(norm):
-                cands |= norm_to_ped.get(v, set())
-
-            if len(cands) == 1:
-                chosen, method, score = next(iter(cands)), "exact", 100
-            elif len(cands) > 1:
-                reason = "exact name maps to several PED numbers"
-            else:
-                sq = squash_to_ped.get(_squash(norm), set())
-                if len(sq) == 1:
-                    chosen, method, score = next(iter(sq)), "squash", 99
+            for tier, key, table in (("exact/light", lt, light),
+                                     ("squash/light", _squash(lt), sq_light),
+                                     ("exact/heavy", hv, heavy),
+                                     ("squash/heavy", _squash(hv), sq_heavy)):
+                if chosen or not key:
+                    continue
+                if tier == "exact/heavy":
+                    peds: set[str] = set()
+                    for v in _name_variants(hv):
+                        peds |= table.get(v, set())
+                else:
+                    peds = table.get(key, set())
+                if len(peds) == 1:
+                    chosen, method = next(iter(peds)), tier
+                    score = 100 if tier.startswith("exact") else 99
+                elif len(peds) > 1 and not reason:
+                    reason = f"{tier} maps to several schools: {_describe([key])}"
 
             if not chosen and not strict and not reason:
-                tied, s, m = _best_fuzzy(norm, choices, token_cut, partial_cut)
-                if tied:
+                for label, probe, table, choices in (
+                        ("light", lt, light, light_choices),
+                        ("heavy", hv, heavy, heavy_choices)):
+                    if chosen or not probe:
+                        continue
+                    tied, s, m = _best_fuzzy(probe, choices, token_cut, partial_cut)
+                    if not tied:
+                        continue
                     # Several roster spellings can tie legitimately when they
                     # are variants of ONE school, so judge by PED number, not
                     # by how many strings tied. A tie spanning two PED numbers
                     # is a real ambiguity and must not be guessed at.
                     peds = set()
                     for t in tied:
-                        peds |= norm_to_ped.get(t, set())
+                        peds |= table.get(t, set())
                     if len(peds) == 1:
-                        chosen, method, score = next(iter(peds)), f"fuzzy/{m}", s
+                        chosen, method, score = next(iter(peds)), f"fuzzy/{m}/{label}", s
                     else:
-                        reason = (f"ambiguous — {len(peds)} schools tied at "
-                                  f"{s:.0f}: {', '.join(sorted(peds)[:4])}")
-                elif not reason:
-                    reason = ("below threshold" if len(norm) >= _MIN_FUZZY_LEN
+                        reason = (f"ambiguous — tied at {s:.0f} between "
+                                  f"{_describe(tied)} ({', '.join(sorted(peds)[:4])})")
+                if not chosen and not reason:
+                    reason = ("below threshold" if len(hv) >= _MIN_FUZZY_LEN
                               else "name too short to fuzzy-match safely")
             elif not chosen and strict and not reason:
                 reason = "no exact match (strict mode)"
@@ -689,7 +769,8 @@ def _match_source(src, raw_col, norm_col, norm_to_ped, squash_to_ped,
             "_src_idx": i,
             "source": source_label,
             "source_name": raw,
-            "source_name_norm": norm,
+            "source_name_light": lt,
+            "source_name_norm": hv,
             "matched_PED_NO": chosen or "",
             "match_method": method,
             "match_score": round(float(score), 1),
@@ -697,20 +778,26 @@ def _match_source(src, raw_col, norm_col, norm_to_ped, squash_to_ped,
         })
 
     log = pd.DataFrame(rows, columns=[
-        "_src_idx", "source", "source_name", "source_name_norm",
-        "matched_PED_NO", "match_method", "match_score", "reason"])
+        "_src_idx", "source", "source_name", "source_name_light",
+        "source_name_norm", "matched_PED_NO", "match_method",
+        "match_score", "reason"])
 
     # Fan-out guard: if two source rows resolved to the same PED_NO, keeping
     # both would duplicate that LEA in the merged frame. Keep the strongest
-    # and mark the loser in the log.
+    # and tell the loser exactly which row and PED it lost to — without that,
+    # a "duplicate" verdict is unactionable.
     hits = log[log["matched_PED_NO"].ne("")].copy()
     if not hits.empty:
-        hits = hits.sort_values("match_score", ascending=False)
+        hits = hits.sort_values("match_score", ascending=False, kind="stable")
         dupe_mask = hits.duplicated("matched_PED_NO", keep="first")
-        losers = hits[dupe_mask].index
-        log.loc[losers, "reason"] = "duplicate — another row matched this PED first"
-        log.loc[losers, "matched_PED_NO"] = ""
-        log.loc[losers, "match_method"] = ""
+        winners = (hits[~dupe_mask].set_index("matched_PED_NO")["source_name"].to_dict())
+        for idx_, lr in hits[dupe_mask].iterrows():
+            ped = lr["matched_PED_NO"]
+            log.loc[idx_, "reason"] = (
+                f"duplicate — {ped} was already claimed by "
+                f"{winners.get(ped, '?')!r}")
+            log.loc[idx_, "matched_PED_NO"] = ""
+            log.loc[idx_, "match_method"] = ""
         hits = hits[~dupe_mask]
 
     return hits[["_src_idx", "matched_PED_NO", "match_method", "match_score"]], log
@@ -738,18 +825,19 @@ def merge_all(assign, districts, directory, busmgr, overrides=None,
             ped = _clean(orow["PED_NO"])
             if cname and ped:
                 override_map[cname.lower()] = ped
+                override_map[normalize_light(cname)] = ped
                 override_map[normalize_name(cname)] = ped
 
     # ── Charters ─────────────────────────────────────────────────────
     assign_c = assign[assign["LEA_TYPE"].apply(_is_charter)].copy()
-    norm_to_ped, squash_to_ped = _build_roster_index(assign_c)
+    roster_idx = _build_roster_index(assign_c)
 
     merged_c = assign_c.copy()
     logs = []
 
-    for src, raw_col, norm_col, label in (
-        (directory, "CH_NAME", "CH_NAME_NORM", "directory"),
-        (busmgr,    "BM_SCHOOL", "BM_NAME_NORM", "business_manager"),
+    for src, raw_col, light_col, norm_col, label in (
+        (directory, "CH_NAME",   "CH_NAME_LIGHT", "CH_NAME_NORM", "directory"),
+        (busmgr,    "BM_SCHOOL", "BM_NAME_LIGHT", "BM_NAME_NORM", "business_manager"),
     ):
         method_col = f"match_method_{label}"
         score_col  = f"match_score_{label}"
@@ -759,7 +847,7 @@ def merge_all(assign, districts, directory, busmgr, overrides=None,
             continue
 
         hits, log = _match_source(
-            src, raw_col, norm_col, norm_to_ped, squash_to_ped,
+            src, raw_col, light_col, norm_col, roster_idx,
             override_map, token_cut, partial_cut, strict, label)
         logs.append(log.drop(columns=["_src_idx"]))
 
