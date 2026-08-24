@@ -1,6 +1,6 @@
 # Merge_ped_contacts_v2.py — PED Contacts Manager (Streamlined)
 # Merges analyst assignments with district/charter contact sheets.
-# Charter matching uses fuzzy name matching (no PED# in charter sheet).
+# Charter matching uses fuzzy name matching (no PED# in charter sheets).
 # Districts match on PED_NO directly.
 #
 # Design pass (Jun 2026): de-emojified, restyled to "institutional clarity"
@@ -13,6 +13,33 @@
 #   app with a KeyError. _prep_assignments() now resolves analyst-related
 #   headers the same fuzzy way PED_NO/LEA_TYPE/LEA_NAME already were,
 #   instead of requiring an exact literal match.
+#
+# Patch (Aug 2026): CHARTER SOURCE REPLACED. The old single charter contact
+#   sheet was retired. Charters now come from the Charter Schools Division's
+#   "New Mexico Charter School Directory 2026-27" workbook, across TWO tabs:
+#     • "All Charter Schools"  — authorizer, contract term, enrollment cap,
+#       grades, phone, street address, Administrator (the charter rep) + email
+#     • "Business Managers"    — mailing address, business manager name,
+#       title, email, phone
+#   Neither tab carries a PED number, so both are matched by name against the
+#   assignments roster independently (one fuzzy hop each) rather than chaining
+#   BM -> Directory -> assignments, which would compound match error.
+#
+#   Three hazards this patch specifically defends against:
+#     1. CSD keeps editorial notes inside the school-name column — "(CLOSED)",
+#        "(formerly known as X)", "(opening 2025-26)", "(The)". normalize_name()
+#        now strips note-parentheticals before matching, and charter_status()
+#        captures the status so it is surfaced instead of silently mangled.
+#     2. The two tabs disagree on names ("(The) ASK Academy" vs "ASK Academy
+#        (The)"; "Explore Academy Albuquerque" vs plain "Explore Academy").
+#     3. AMBIGUOUS FUZZY TIES. token_set_ratio scores a short name like
+#        "explore" at 100 against explore albuquerque / las cruces / rio rancho
+#        simultaneously. The previous code used process.extractOne(), which
+#        returns an arbitrary winner among ties and passed the len(ps)==1
+#        guard — i.e. it would silently attach contacts to the WRONG school.
+#        _best_fuzzy() now detects ties and refuses rather than guessing;
+#        refusals are written to the match log with reason="ambiguous" so
+#        they can be resolved once in the overrides sheet.
 
 import re, os, base64, urllib.parse
 from datetime import datetime
@@ -72,10 +99,12 @@ h1, h2, h3, h4 { color: #245d62; font-weight: 600; }
 .pill { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px; }
 .pill-matched   { color: #1a474b; background: #e1efe9; }
 .pill-unmatched { color: #993c1d; background: #faece7; }
+.pill-partial   { color: #7a5c12; background: #fbf3dd; }
 .badge {
     font-size: 12px; color: #5f5e5a; background: #f1efe8;
     padding: 3px 9px; border-radius: 6px;
 }
+.badge-alert { color: #993c1d; background: #faece7; font-weight: 600; }
 
 /* Links — teal, not coral (coral is reserved for alerts) */
 a { color: #245d62; text-decoration: none; }
@@ -154,12 +183,37 @@ def ped_canonical(x: str) -> str:
         return s
 
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
+
+def _valid_email(x) -> str:
+    """Return a usable address, or '' — CSD parks prose like 'Please contact
+    CSD' in the email column, and occasionally leaves a trailing comma/period."""
+    s = _clean(x).strip(" ,;.")
+    if not s:
+        return ""
+    # some cells hold two addresses separated by , or ; — take the first valid
+    for part in re.split(r"[,;]\s*", s):
+        p = part.strip()
+        if _EMAIL_RE.match(p):
+            return p
+    return ""
+
+
 # ── Name normalisation (for charter fuzzy matching) ──────────────────
 _ARTICLES = re.compile(r"\b(the|a|an)\b")
 _SUFFIXES = re.compile(
     r"\b(public|charter|school|schools|academy|district|high|middle|"
     r"elementary|prep|preparatory|learning|center|centers)\b"
 )
+
+# Parenthetical groups that are CSD's editorial notes, not part of the name.
+# Anything else in parens (e.g. "(DEAP)") is kept, since it may disambiguate.
+_NOTE_PAREN = re.compile(
+    r"\([^)]*\b(formerly|formally|previously|renamed|closed|close|closing|"
+    r"opening|opens|pending|inactive|fka|f/k/a|vote|new site)\b[^)]*\)"
+)
+_STATUS_WORDS = re.compile(r"\b(closed|inactive)\b")
+
 _KNOWN_RENAMES = {
     "academy for technology and the classics the":
         "academy for technology and the classics",
@@ -174,11 +228,36 @@ def normalize_name(name: str) -> str:
         return ""
     s = unidecode(str(name)).lower()
     s = re.sub(r"\(formerly[^)]*\)", " ", s)
-    s = re.sub(r"[-/.,&]+", " ", s)
+    s = _NOTE_PAREN.sub(" ", s)              # "(CLOSED)", "(opening 2025-26)"…
+    s = re.sub(r"[()\[\]]", " ", s)          # keep the contents of other parens
+    s = _STATUS_WORDS.sub(" ", s)            # bare "CLOSED" with no parens
+    s = re.sub(r"[\u2010-\u2015]", " ", s)   # en/em dashes → space
+    s = re.sub(r"['\u2018\u2019`]", "", s)   # d'Arte → dArte
+    s = re.sub(r"[-/.,&:;#]+", " ", s)
     s = _ARTICLES.sub(" ", s)
     s = _SUFFIXES.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return _KNOWN_RENAMES.get(s, s)
+
+
+def _squash(s: str) -> str:
+    """Whitespace/punctuation-free key. Rescues spacing-only differences
+    such as 'alma darte' vs 'alma d arte'."""
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def charter_status(raw_name: str) -> str:
+    """Read CSD's inline note out of the name cell so it can be shown as a
+    badge rather than quietly deleted by normalisation."""
+    s = unidecode(_clean(raw_name)).lower()
+    if re.search(r"\bclosed?\b|\bclosing\b", s):
+        return "Closed"
+    if re.search(r"\bopening\b|\bopens\b", s):
+        return "Opening"
+    if re.search(r"\binactive\b", s):
+        return "Inactive"
+    return ""
+
 
 def _name_variants(n: str) -> set[str]:
     if not n:
@@ -198,41 +277,86 @@ def _is_district(code: str) -> bool:
     return _clean(code).upper() in {"D", "DISTRICT"}
 
 
+# Fuzzy matches shorter than this are refused outright: once normalize_name()
+# has stripped "academy"/"school"/"charter", names like "taos" or "ask" are too
+# thin to fuzzy-match safely. They can still land via the exact/squash tiers.
+_MIN_FUZZY_LEN = 5
+
+
 def _best_fuzzy(target: str, choices: list[str],
                 token_cut=92, partial_cut=96):
-    """Return (matched_name, score, method) or (None, 0, '')."""
-    if not target or not choices:
-        return None, 0, ""
-    b1 = process.extractOne(target, choices, scorer=fuzz.token_set_ratio)
-    if b1 and b1[1] >= token_cut:
-        return b1[0], b1[1], "token_set"
-    b2 = process.extractOne(target, choices, scorer=fuzz.partial_ratio)
-    if b2 and b2[1] >= partial_cut:
-        return b2[0], b2[1], "partial"
-    return None, 0, ""
+    """Return (tied_names, score, method) — every roster name sharing the top
+    score, not just one of them.
+
+    This is the fix for the silent-mismatch bug. process.extractOne() collapses
+    ties to an arbitrary winner, so a short probe like "explore" (which scores
+    100 against explore albuquerque / las cruces / rio rancho simultaneously)
+    would be handed one campus at random and pass the old len(ps)==1 guard.
+    Returning the full tied set lets the caller decide by PED number: ties that
+    all resolve to the same school are fine, ties that straddle schools are not.
+    """
+    if not target or not choices or len(target) < _MIN_FUZZY_LEN:
+        return [], 0, ""
+    for scorer, cut, label in ((fuzz.token_set_ratio, token_cut, "token_set"),
+                               (fuzz.partial_ratio, partial_cut, "partial")):
+        hits = process.extract(target, choices, scorer=scorer, limit=25)
+        if not hits:
+            continue
+        top = hits[0][1]
+        if top < cut:
+            continue
+        return [h[0] for h in hits if h[1] >= top - 0.01], top, label
+    return [], 0, ""
 
 
 # ═════════════════════════════════════════════════════════════════════
 # DATA LOADING
 # ═════════════════════════════════════════════════════════════════════
 
+# The charter workbook is owned by the Charter Schools Division. We have read
+# access only, so if a tab moves or is retired, patch the gid here and move on.
+CHARTER_BOOK = "1_Uws15oI1t0K4ccdiIiX2cbixqHglPBuopdEEWbkXFM"
+
 SHEETS = {
     "districts":   "https://docs.google.com/spreadsheets/d/1vkzVbwmg3LktPWlxK-SIi28hSIaP2YIG_wnp2FgWPYE/export?format=csv&gid=0",
-    "charters":    "https://docs.google.com/spreadsheets/d/1GQvRVXTwje6mhCyeZsGxUMH64RzAPOcstT24ANxcGK8/export?format=csv&gid=0",
     "assignments": "https://docs.google.com/spreadsheets/d/1uZY1Ep9jMpachr7MtBBy5Rwi25iVv80jp0X3i_e1ezg/export?format=csv&gid=1629654616",
     "overrides":   "https://docs.google.com/spreadsheets/d/1K-Hh7p9I30wjjumTeKy44D_VZnGmL87oJuNEYLywt5w/export?format=csv&gid=0",
+    # NM Charter School Directory 2026-27 (Charter Schools Division)
+    "charter_directory": f"https://docs.google.com/spreadsheets/d/{CHARTER_BOOK}/export?format=csv&gid=1811433778",   # All Charter Schools
+    "charter_busmgr":    f"https://docs.google.com/spreadsheets/d/{CHARTER_BOOK}/export?format=csv&gid=352262694",    # Business Managers
 }
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_sheets():
-    """Load all four sheets; return (assign, districts, charters, overrides, timestamp)."""
+    """Load every sheet; return (assign, districts, directory, busmgr,
+    overrides, notes, timestamp).
+
+    The two charter tabs load defensively: if CSD retires or re-gids one of
+    them, the district side of the app must keep working rather than blanking
+    the whole screen. Failures come back as a note shown in the sidebar.
+    """
     ts = datetime.now().strftime("%b %d %Y, %I:%M %p")
+    notes: list[str] = []
+
     assign    = pd.read_csv(SHEETS["assignments"], dtype=str).fillna("")
     districts = pd.read_csv(SHEETS["districts"],   dtype=str).fillna("")
-    charters  = pd.read_csv(SHEETS["charters"],    dtype=str).fillna("")
+
+    def _try(key, label):
+        try:
+            df = pd.read_csv(SHEETS[key], dtype=str).fillna("")
+            if df.empty:
+                notes.append(f"{label} loaded but is empty.")
+            return df
+        except Exception as exc:
+            notes.append(f"{label} could not be loaded ({type(exc).__name__}). "
+                         f"Check the gid in SHEETS['{key}'].")
+            return pd.DataFrame()
+
+    directory = _try("charter_directory", "Charter directory tab")
+    busmgr    = _try("charter_busmgr",    "Business Managers tab")
+
     try:
         overrides = pd.read_csv(SHEETS["overrides"], dtype=str).fillna("")
-        # Normalise column names
         col_map = {}
         for c in overrides.columns:
             cl = c.strip().lower()
@@ -250,17 +374,40 @@ def _fetch_sheets():
         ]
     except Exception:
         overrides = pd.DataFrame(columns=["CHARTER_NAME", "PED_NO"])
-    return assign, districts, charters, overrides, ts
+
+    return assign, districts, directory, busmgr, overrides, notes, ts
 
 
 # ── Column normalisation helpers ─────────────────────────────────────
 
-def _find_col(df: pd.DataFrame, candidates: list[str]):
-    """Return first matching column name (case-insensitive) or None."""
-    lc = {c.strip().lower(): c for c in df.columns}
+def _hdr_key(s: str) -> str:
+    """Comparison key for a header: lowercase, alphanumerics only.
+    CSD writes headers with trailing colons ('Charter School:'), so a plain
+    case-insensitive compare misses them."""
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool = False):
+    """Return the first matching column name, or None.
+
+    Exact (punctuation-insensitive) match is tried across all candidates
+    first; only then, if contains=True, a substring match. That ordering
+    matters — 'Name' must bind to 'Name:' before it is allowed to bind to
+    something merely containing 'name'.
+    """
+    keyed = {_hdr_key(c): c for c in df.columns}
     for cand in candidates:
-        if cand.strip().lower() in lc:
-            return lc[cand.strip().lower()]
+        k = _hdr_key(cand)
+        if k in keyed:
+            return keyed[k]
+    if contains:
+        for cand in candidates:
+            k = _hdr_key(cand)
+            if not k:
+                continue
+            for hk, orig in keyed.items():
+                if k in hk:
+                    return orig
     return None
 
 
@@ -276,8 +423,7 @@ def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
         "Analyst Email":      ["Analyst Email", "Analyst E-mail", "ANALYST EMAIL"],
         # CONFIRMED via screenshot of the live sheet (Jul 2026): the header
         # was renamed from "Analyst Reports To" -> "Analyst Manager", with
-        # two new sibling columns added alongside it (captured below but
-        # not yet surfaced in the UI — see note near display_contact()).
+        # two new sibling columns added alongside it.
         "Analyst Reports To": ["Analyst Reports To", "Analyst Manager", "Reports To",
                                 "Supervisor", "Analyst Supervisor", "ANALYST REPORTS TO",
                                 "ANALYST MANAGER"],
@@ -299,15 +445,11 @@ def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
             f"in the assignments sheet. Raw columns present: {df.columns.tolist()}"
         )
 
-    # Analyst fields are used downstream (filters, contact cards) but aren't
-    # strictly required to build PED_NO/LEA_TYPE/LEA_NAME — so instead of
-    # crashing, backfill with empty strings and surface a warning in the app
-    # if the source sheet drops/renames one of them again in the future.
     for optional_col in ["Analyst", "Analyst Email", "Analyst Reports To",
                           "Analyst Phone", "Analyst Manager Email", "Analyst Manager Phone"]:
         if optional_col not in df.columns:
             st.sidebar.warning(
-                f"⚠️ Column '{optional_col}' not found in assignments sheet — "
+                f"Column '{optional_col}' not found in assignments sheet — "
                 f"filters/cards using it will show blanks. "
                 f"Raw columns: {df.columns.tolist()}"
             )
@@ -327,27 +469,226 @@ def _prep_districts(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _prep_charters(df: pd.DataFrame) -> pd.DataFrame:
-    ct = _find_col(df, ["Charter Type", "CHARTER TYPE", "LEA Type", "Type"])
-    cn = _find_col(df, ["CHARTER NAME", "School Name", "Organization Name", "Name"])
-    if ct and cn:
-        df["CHARTER TYPE"]      = df[ct].str.strip().str.title()
-        df["CHARTER NAME"]      = df[cn].str.strip()
-        df["CHARTER_NAME_NORM"] = df["CHARTER NAME"].apply(normalize_name)
-    return df
+def _collapse_merged_rows(df: pd.DataFrame, name_col: str) -> pd.DataFrame:
+    """Rebuild rows that a vertical cell-merge split apart.
+
+    CSD merges the name/authorizer cells for schools listed with two grade
+    bands (Explore Academy Albuquerque spans two rows: K-5 and 6-12). A CSV
+    export writes the merged value only on the first row and leaves the rest
+    blank, so a naive read produces one usable row plus one nameless orphan
+    holding half the contact data. Group on the forward-filled name and take
+    the first non-empty value in each column.
+    """
+    if df.empty or name_col not in df.columns:
+        return df
+    work = df.copy()
+    work["_grp"] = work[name_col].replace("", None).ffill()
+    work = work[work["_grp"].notna()]
+    if work.empty:
+        return df.iloc[0:0]
+    agg = {c: (lambda s: next((v for v in s if _clean(v)), ""))
+           for c in work.columns if c != "_grp"}
+    return work.groupby("_grp", sort=False).agg(agg).reset_index(drop=True)
+
+
+def _prep_charter_directory(df: pd.DataFrame) -> pd.DataFrame:
+    """'All Charter Schools' tab — administrator (the charter rep) + profile."""
+    if df.empty:
+        return df
+    mapping = {
+        "CH_AUTHORIZER":     (["Authorizer"], False),
+        "CH_NAME":           (["Charter School", "School Name", "Charter Name"], False),
+        "CH_CONTRACT_TERM":  (["Contract Term"], False),
+        "CH_ENROLL_CAP":     (["Enrollment Cap"], True),
+        "CH_GRADES_AUTH":    (["Grades Authorized"], True),
+        "CH_GRADES_SERVED":  (["Grades Served"], True),
+        "CH_PHONE":          (["Phone Number", "Phone"], False),
+        "CH_ADDRESS":        (["Street Address", "Address"], False),
+        # Header reads "Administrator (SY26-27 changes highlighted)" — the
+        # parenthetical is CSD's own annotation and will change each year,
+        # so this one has to bind by substring.
+        "CH_ADMIN_NAME":     (["Administrator"], True),
+        "CH_ADMIN_EMAIL":    (["Administrator Email", "Admin Email"], True),
+    }
+    # Bind email before name so the substring pass can't hand "Administrator"
+    # the "Administrator Email" column.
+    order = ["CH_ADMIN_EMAIL", "CH_ADMIN_NAME"] + [
+        k for k in mapping if k not in ("CH_ADMIN_EMAIL", "CH_ADMIN_NAME")]
+    taken: set[str] = set()
+    for canon in order:
+        cands, contains = mapping[canon]
+        pool = df.drop(columns=[c for c in taken if c in df.columns], errors="ignore")
+        col = _find_col(pool, cands, contains=contains)
+        if col:
+            taken.add(col)
+            df = df.rename(columns={col: canon})
+
+    if "CH_NAME" not in df.columns:
+        st.sidebar.warning(
+            "Charter directory tab: no school-name column found. "
+            f"Raw columns: {df.columns.tolist()}"
+        )
+        return pd.DataFrame()
+
+    df = _collapse_merged_rows(df, "CH_NAME")
+    df = df[df["CH_NAME"].apply(_clean).ne("")]
+    df["CH_STATUS"]    = df["CH_NAME"].apply(charter_status)
+    df["CH_NAME_NORM"] = df["CH_NAME"].apply(normalize_name)
+    if "CH_ADMIN_EMAIL" in df.columns:
+        df["CH_ADMIN_EMAIL"] = df["CH_ADMIN_EMAIL"].apply(_valid_email)
+    return df.reset_index(drop=True)
+
+
+def _prep_charter_busmgr(df: pd.DataFrame) -> pd.DataFrame:
+    """'Business Managers' tab.
+
+    Its headers are bare and generic — 'Name:', 'Title:', 'Email:',
+    'Phone Number:' — which would collide with district and directory columns
+    on merge, so everything is renamed to a BM_ prefix up front.
+    """
+    if df.empty:
+        return df
+    mapping = {
+        "BM_NAME":     ["Name"],
+        "BM_TITLE":    ["Title"],
+        "BM_EMAIL":    ["Email"],
+        "BM_PHONE":    ["Phone Number", "Phone"],
+        "BM_SCHOOL":   ["Charter School", "School Name", "Charter Name"],
+        "BM_ADDRESS":  ["Mailing Address", "Address"],
+        "BM_CITY":     ["City"],
+        "BM_ZIP":      ["Zip", "Zip Code"],
+    }
+    for canon, cands in mapping.items():
+        col = _find_col(df, cands)
+        if col:
+            df = df.rename(columns={col: canon})
+
+    if "BM_SCHOOL" not in df.columns:
+        st.sidebar.warning(
+            "Business Managers tab: no school-name column found. "
+            f"Raw columns: {df.columns.tolist()}"
+        )
+        return pd.DataFrame()
+
+    df = _collapse_merged_rows(df, "BM_SCHOOL")
+    df = df[df["BM_SCHOOL"].apply(_clean).ne("")]
+    df["BM_NAME_NORM"] = df["BM_SCHOOL"].apply(normalize_name)
+    if "BM_EMAIL" in df.columns:
+        df["BM_EMAIL"] = df["BM_EMAIL"].apply(_valid_email)
+    return df.reset_index(drop=True)
 
 
 # ═════════════════════════════════════════════════════════════════════
-# MERGE
+# MATCHING
 # ═════════════════════════════════════════════════════════════════════
 
-def merge_all(assign, districts, charters, overrides=None,
+def _build_roster_index(assign_c: pd.DataFrame):
+    """normalised-name → {PED_NO}, plus a squashed-key index."""
+    norm_to_ped: dict[str, set[str]] = {}
+    squash_to_ped: dict[str, set[str]] = {}
+    for _, r in assign_c[["PED_NO", "LEA_NAME_NORM"]].drop_duplicates().iterrows():
+        ped, n = r["PED_NO"], r["LEA_NAME_NORM"]
+        if not n or not ped:
+            continue
+        for v in _name_variants(n):
+            norm_to_ped.setdefault(v, set()).add(ped)
+            squash_to_ped.setdefault(_squash(v), set()).add(ped)
+    return norm_to_ped, squash_to_ped
+
+
+def _match_source(src, raw_col, norm_col, norm_to_ped, squash_to_ped,
+                  override_map, token_cut, partial_cut, strict, source_label):
+    """Match one charter tab against the assignments roster.
+
+    Tiers: override → exact/variant → squashed → fuzzy (tie-guarded).
+    Every row produces a log entry, matched or not, with the reason.
+    """
+    choices = [n for n in norm_to_ped if n]
+    rows = []
+    for i, r in src.reset_index(drop=True).iterrows():
+        raw  = _clean(r.get(raw_col, ""))
+        norm = _clean(r.get(norm_col, ""))
+        if not raw and not norm:
+            continue
+
+        chosen, method, score, reason = None, "", 0, ""
+
+        ped = override_map.get(normalize_name(raw)) or override_map.get(raw.lower())
+        if ped:
+            chosen, method, score = ped, "override", 100
+        else:
+            cands: set[str] = set()
+            for v in _name_variants(norm):
+                cands |= norm_to_ped.get(v, set())
+
+            if len(cands) == 1:
+                chosen, method, score = next(iter(cands)), "exact", 100
+            elif len(cands) > 1:
+                reason = "exact name maps to several PED numbers"
+            else:
+                sq = squash_to_ped.get(_squash(norm), set())
+                if len(sq) == 1:
+                    chosen, method, score = next(iter(sq)), "squash", 99
+
+            if not chosen and not strict and not reason:
+                tied, s, m = _best_fuzzy(norm, choices, token_cut, partial_cut)
+                if tied:
+                    # Several roster spellings can tie legitimately when they
+                    # are variants of ONE school, so judge by PED number, not
+                    # by how many strings tied. A tie spanning two PED numbers
+                    # is a real ambiguity and must not be guessed at.
+                    peds = set()
+                    for t in tied:
+                        peds |= norm_to_ped.get(t, set())
+                    if len(peds) == 1:
+                        chosen, method, score = next(iter(peds)), f"fuzzy/{m}", s
+                    else:
+                        reason = (f"ambiguous — {len(peds)} schools tied at "
+                                  f"{s:.0f}: {', '.join(sorted(peds)[:4])}")
+                elif not reason:
+                    reason = ("below threshold" if len(norm) >= _MIN_FUZZY_LEN
+                              else "name too short to fuzzy-match safely")
+            elif not chosen and strict and not reason:
+                reason = "no exact match (strict mode)"
+
+        rows.append({
+            "_src_idx": i,
+            "source": source_label,
+            "source_name": raw,
+            "source_name_norm": norm,
+            "matched_PED_NO": chosen or "",
+            "match_method": method,
+            "match_score": round(float(score), 1),
+            "reason": reason,
+        })
+
+    log = pd.DataFrame(rows, columns=[
+        "_src_idx", "source", "source_name", "source_name_norm",
+        "matched_PED_NO", "match_method", "match_score", "reason"])
+
+    # Fan-out guard: if two source rows resolved to the same PED_NO, keeping
+    # both would duplicate that LEA in the merged frame. Keep the strongest
+    # and mark the loser in the log.
+    hits = log[log["matched_PED_NO"].ne("")].copy()
+    if not hits.empty:
+        hits = hits.sort_values("match_score", ascending=False)
+        dupe_mask = hits.duplicated("matched_PED_NO", keep="first")
+        losers = hits[dupe_mask].index
+        log.loc[losers, "reason"] = "duplicate — another row matched this PED first"
+        log.loc[losers, "matched_PED_NO"] = ""
+        log.loc[losers, "match_method"] = ""
+        hits = hits[~dupe_mask]
+
+    return hits[["_src_idx", "matched_PED_NO", "match_method", "match_score"]], log
+
+
+def merge_all(assign, districts, directory, busmgr, overrides=None,
               token_cut=92, partial_cut=96, strict=False):
     """Return (merged_df, match_log_df).
 
-    Overrides are applied first: charter names in the overrides table
-    are matched by exact CHARTER_NAME → PED_NO, skipping fuzzy logic.
-    Remaining charters fall through to fuzzy matching as before.
+    The assignments sheet is the spine — it is the only source carrying
+    PED_NO. Districts join on PED_NO. Each charter tab is name-matched to the
+    spine independently, so a miss in one tab never suppresses the other.
     """
 
     # ── Districts: straight PED_NO join ──────────────────────────────
@@ -355,7 +696,7 @@ def merge_all(assign, districts, charters, overrides=None,
     merged_d = assign_d.merge(districts, on="PED_NO", how="left",
                               suffixes=("", "_DIST"))
 
-    # ── Build override lookup: charter name (as-is) → PED_NO ────────
+    # ── Override lookup: charter name → PED_NO (normalised + raw) ────
     override_map: dict[str, str] = {}
     if overrides is not None and not overrides.empty:
         for _, orow in overrides.iterrows():
@@ -363,76 +704,53 @@ def merge_all(assign, districts, charters, overrides=None,
             ped = _clean(orow["PED_NO"])
             if cname and ped:
                 override_map[cname.lower()] = ped
+                override_map[normalize_name(cname)] = ped
 
-    # ── Charters: overrides first, then fuzzy ────────────────────────
+    # ── Charters ─────────────────────────────────────────────────────
     assign_c = assign[assign["LEA_TYPE"].apply(_is_charter)].copy()
+    norm_to_ped, squash_to_ped = _build_roster_index(assign_c)
 
-    # Build lookup: normalised name → set of PED_NOs
-    name_to_ped: dict[str, set[str]] = {}
-    for _, r in assign_c[["PED_NO", "LEA_NAME_NORM"]].drop_duplicates().iterrows():
-        for v in _name_variants(r["LEA_NAME_NORM"]):
-            name_to_ped.setdefault(v, set()).add(r["PED_NO"])
+    merged_c = assign_c.copy()
+    logs = []
 
-    unique_norms = list({n for ns in name_to_ped for n in [ns] if n})
-
-    matches = []
-    for i, r in charters.reset_index(drop=True).iterrows():
-        raw_name = _clean(r.get("CHARTER NAME", ""))
-        norm = r.get("CHARTER_NAME_NORM", "")
-        if not raw_name and not norm:
+    for src, raw_col, norm_col, label in (
+        (directory, "CH_NAME", "CH_NAME_NORM", "directory"),
+        (busmgr,    "BM_SCHOOL", "BM_NAME_NORM", "business_manager"),
+    ):
+        method_col = f"match_method_{label}"
+        score_col  = f"match_score_{label}"
+        if src is None or src.empty or raw_col not in src.columns:
+            merged_c[method_col] = ""
+            merged_c[score_col] = 0.0
             continue
 
-        chosen, method, score = None, "", 0
+        hits, log = _match_source(
+            src, raw_col, norm_col, norm_to_ped, squash_to_ped,
+            override_map, token_cut, partial_cut, strict, label)
+        logs.append(log.drop(columns=["_src_idx"]))
 
-        # 1) Check overrides first (exact charter name match)
-        override_ped = override_map.get(raw_name.lower())
-        if override_ped:
-            chosen, method, score = override_ped, "override", 100
-        else:
-            # 2) Try exact / variant match
-            cand_peds: set[str] = set()
-            for v in _name_variants(norm):
-                cand_peds |= name_to_ped.get(v, set())
-
-            if len(cand_peds) == 1:
-                chosen, method, score = next(iter(cand_peds)), "exact", 100
-            elif not strict:
-                # 3) Fuzzy fallback
-                best_name, s, m = _best_fuzzy(
-                    norm, unique_norms, token_cut, partial_cut
-                )
-                if best_name:
-                    ps = name_to_ped.get(best_name, set())
-                    if len(ps) == 1:
-                        chosen, method, score = next(iter(ps)), f"fuzzy/{m}", s
-
-        if chosen:
-            matches.append({
-                "_charter_idx": i,
-                "matched_PED_NO": chosen,
-                "match_method": method,
-                "match_score": score,
-            })
-
-    match_log = pd.DataFrame(matches)
-    merged_c = assign_c.copy()
-
-    if not match_log.empty:
-        # Join charter contact rows via PED_NO
-        charter_contacts = charters.reset_index().rename(
-            columns={"index": "_charter_idx"}
-        )
-        matched = match_log.merge(charter_contacts, on="_charter_idx", how="left")
+        payload = src.reset_index().rename(columns={"index": "_src_idx"})
+        payload = hits.merge(payload, on="_src_idx", how="left").drop(columns=["_src_idx"])
+        payload = payload.rename(columns={"match_method": method_col,
+                                          "match_score": score_col})
         merged_c = merged_c.merge(
-            matched, left_on="PED_NO", right_on="matched_PED_NO",
-            how="left", suffixes=("", "_CHARTER"),
-        )
-    for col in ("match_method", "match_score"):
-        if col not in merged_c.columns:
-            merged_c[col] = ""
+            payload, left_on="PED_NO", right_on="matched_PED_NO",
+            how="left", suffixes=("", f"_{label.upper()}"))
+        merged_c = merged_c.drop(columns=["matched_PED_NO"], errors="ignore")
+        merged_c[method_col] = merged_c[method_col].fillna("")
+        merged_c[score_col]  = pd.to_numeric(merged_c[score_col], errors="coerce").fillna(0.0)
+
+    match_log = (pd.concat(logs, ignore_index=True) if logs
+                 else pd.DataFrame(columns=["source", "source_name", "matched_PED_NO",
+                                            "match_method", "match_score", "reason"]))
 
     # ── Combine ──────────────────────────────────────────────────────
     merged = pd.concat([merged_d, merged_c], ignore_index=True)
+
+    for col in ("match_method_directory", "match_method_business_manager"):
+        if col not in merged.columns:
+            merged[col] = ""
+        merged[col] = merged[col].fillna("")
 
     # Matched flag
     dist_cols = ["DISTRICT NAME", "SUPT. E-MAIL", "BUS. MGR. E-MAIL"]
@@ -441,10 +759,27 @@ def merge_all(assign, districts, charters, overrides=None,
         if all(c in merged.columns for c in dist_cols)
         else pd.Series(False, index=merged.index)
     )
-    has_charter = merged.get("match_method", pd.Series(dtype=str)).fillna("").ne("")
+    has_admin = merged["match_method_directory"].ne("")
+    has_bm    = merged["match_method_business_manager"].ne("")
+    is_charter_row = merged["LEA_TYPE"].isin(["SC", "LC"])
+
+    merged["Matched_Directory"] = has_admin & is_charter_row
+    merged["Matched_BusMgr"]    = has_bm & is_charter_row
     merged["Matched"] = (
         (merged["LEA_TYPE"].eq("D") & has_dist)
-        | (merged["LEA_TYPE"].isin(["SC", "LC"]) & has_charter)
+        | (is_charter_row & (has_admin | has_bm))
+    )
+    # A charter that landed in only one of the two tabs is half-populated —
+    # worth seeing at a glance rather than reading as fully matched.
+    merged["Partial"] = is_charter_row & (has_admin ^ has_bm)
+
+    # Convenience column so the summary table reads the same for both types
+    merged["match_method"] = merged.apply(
+        lambda r: " + ".join(filter(None, [
+            _clean(r.get("match_method_directory", "")),
+            _clean(r.get("match_method_business_manager", "")),
+        ])) if r.get("LEA_TYPE", "") in ("SC", "LC") else "",
+        axis=1,
     )
     return merged, match_log
 
@@ -467,15 +802,32 @@ def _contact_block(label: str, fields: list[tuple[str, str]]):
                 st.write(f"**{k}:** {v}")
 
 
+def _or_na(*vals):
+    for v in vals:
+        c = _clean(v)
+        if c:
+            return c
+    return "N/A"
+
+
 def display_contact(row: pd.Series):
     """Render a full contact card for one LEA."""
     lea_type = _clean(row.get("LEA_TYPE", "")).upper()
     charter = lea_type in {"SC", "LC"}
     matched = bool(row.get("Matched", False))
+    partial = bool(row.get("Partial", False))
     type_label = "Charter" if charter else "District"
 
-    pill = ('<span class="pill pill-matched">Matched</span>' if matched
-            else '<span class="pill pill-unmatched">Unmatched</span>')
+    if matched and partial:
+        pill = '<span class="pill pill-partial">Partial</span>'
+    elif matched:
+        pill = '<span class="pill pill-matched">Matched</span>'
+    else:
+        pill = '<span class="pill pill-unmatched">Unmatched</span>'
+
+    status = _clean(row.get("CH_STATUS", ""))
+    status_badge = (f'<span class="badge badge-alert">{status}</span>'
+                    if status else "")
 
     # Header: name + PED / type / status badges
     st.markdown(
@@ -483,49 +835,55 @@ def display_contact(row: pd.Series):
         f'{_clean(row.get("LEA_NAME", "N/A"))}</div>'
         f'<div style="display:flex;gap:8px;align-items:center;margin:10px 0 4px;">'
         f'<span class="badge" style="font-family:monospace;">{_clean(row.get("PED_NO", "N/A"))}</span>'
-        f'<span class="badge">{type_label}</span>{pill}</div>',
+        f'<span class="badge">{type_label}</span>{pill}{status_badge}</div>',
         unsafe_allow_html=True,
     )
 
     # Analyst
-    # NOTE: "Analyst Manager Email" / "Analyst Manager Phone" are now
-    # available from the sheet (added alongside the "Analyst Manager"
-    # rename) but aren't shown here yet — say the word and I'll add them
-    # as extra fields in this block.
     _contact_block("Budget Analyst", [
-        ("Name",       _clean(row.get("Analyst", "N/A"))),
-        ("Email",      _clean(row.get("Analyst Email", "N/A"))),
-        ("Supervisor", _clean(row.get("Analyst Reports To", "N/A"))),
-        ("Phone",      _clean(row.get("Analyst Phone", "N/A"))),
+        ("Name",       _or_na(row.get("Analyst"))),
+        ("Email",      _or_na(row.get("Analyst Email"))),
+        ("Supervisor", _or_na(row.get("Analyst Reports To"))),
+        ("Phone",      _or_na(row.get("Analyst Phone"))),
     ])
 
     if charter:
-        # Rep
-        rep_name = " ".join(filter(None, [
-            _clean(row.get("CHARTER REP PREFIX", "")),
-            _clean(row.get("CHARTER REP FIRST NAME", "")),
-            _clean(row.get("CHARTER REP LAST NAME", "")),
-        ])) or "N/A"
+        # Charter representative — the Administrator column of the directory
         _contact_block("Charter Representative", [
-            ("Name",  rep_name),
-            ("Title", _clean(row.get("CHARTER REP TITLE", "N/A"))),
-            ("Phone", _clean(row.get("REPRESENTATIVE CONTACT PHONE #", ""))
-                      or _clean(row.get("PHONE", "N/A"))),
-            ("Email", _clean(row.get("REPRESENTATIVE EMAIL", "N/A"))),
+            ("Name",  _or_na(row.get("CH_ADMIN_NAME"))),
+            ("Email", _or_na(row.get("CH_ADMIN_EMAIL"))),
+            ("Phone", _or_na(row.get("CH_PHONE"))),
+            ("Authorizer", _or_na(row.get("CH_AUTHORIZER"))),
         ])
 
-        # Fiscal
-        fisc_name = " ".join(filter(None, [
-            _clean(row.get("FISCAL CONTACT PREFIX", "")),
-            _clean(row.get("FISCAL CONTACT FIRST NAME", "")),
-            _clean(row.get("FISCAL CONTACT LAST NAME", "")),
-        ])) or "N/A"
-        _contact_block("Fiscal Contact", [
-            ("Name",  fisc_name),
-            ("Title", _clean(row.get("CONTACT TITLE", "N/A"))),
-            ("Phone", _clean(row.get("FISCAL CONTACT PHONE #", "N/A"))),
-            ("Email", _clean(row.get("CONTACT EMAIL", "N/A"))),
+        # Business Manager — from the Business Managers tab
+        _contact_block("Business Manager", [
+            ("Name",  _or_na(row.get("BM_NAME"))),
+            ("Title", _or_na(row.get("BM_TITLE"))),
+            ("Email", _or_na(row.get("BM_EMAIL"))),
+            ("Phone", _or_na(row.get("BM_PHONE"))),
         ])
+
+        # Charter profile — new information the directory brings along
+        profile = [
+            ("Contract term",    _or_na(row.get("CH_CONTRACT_TERM"))),
+            ("Enrollment cap",   _or_na(row.get("CH_ENROLL_CAP"))),
+            ("Grades authorized", _or_na(row.get("CH_GRADES_AUTH"))),
+            ("Grades served",    _or_na(row.get("CH_GRADES_SERVED"))),
+        ]
+        if any(v != "N/A" for _, v in profile):
+            _contact_block("Charter Profile", profile)
+
+        if not _clean(row.get("CH_ADMIN_NAME")) or not _clean(row.get("BM_NAME")):
+            missing = []
+            if not _clean(row.get("CH_ADMIN_NAME")):
+                missing.append("charter directory")
+            if not _clean(row.get("BM_NAME")):
+                missing.append("business managers")
+            st.caption(
+                "No match in the " + " and ".join(missing) + " tab. "
+                "Check the match log, or add this school to the overrides sheet."
+            )
     else:
         # Superintendent
         supt_name = " ".join(filter(None, [
@@ -535,9 +893,9 @@ def display_contact(row: pd.Series):
         ])) or "N/A"
         _contact_block("Superintendent", [
             ("Name",  supt_name),
-            ("Title", _clean(row.get("SUPT. TITLE", "N/A"))),
-            ("Phone", _clean(row.get("SUPT. PHONE", "N/A"))),
-            ("Email", _clean(row.get("SUPT. E-MAIL", "N/A"))),
+            ("Title", _or_na(row.get("SUPT. TITLE"))),
+            ("Phone", _or_na(row.get("SUPT. PHONE"))),
+            ("Email", _or_na(row.get("SUPT. E-MAIL"))),
         ])
 
         # Business Manager
@@ -548,19 +906,30 @@ def display_contact(row: pd.Series):
         ])) or "N/A"
         _contact_block("Business Manager", [
             ("Name",  bm_name),
-            ("Title", _clean(row.get("BUS. MGR. TITLE", "N/A"))),
-            ("Phone", _clean(row.get("BUS. MGR. PHONE", "N/A"))),
-            ("Email", _clean(row.get("BUS. MGR. E-MAIL", "N/A"))),
+            ("Title", _or_na(row.get("BUS. MGR. TITLE"))),
+            ("Phone", _or_na(row.get("BUS. MGR. PHONE"))),
+            ("Email", _or_na(row.get("BUS. MGR. E-MAIL"))),
         ])
 
     # Address
     parts = []
-    mail = _clean(row.get("MAILING ADDRESS", ""))
-    city = _clean(row.get("CITY", ""))
-    state = _clean(row.get("ST", "") or row.get("STATE", ""))
-    zipcode = _clean(row.get("ZIP", ""))
-    if mail:
-        parts.append(mail)
+    if charter:
+        street = _clean(row.get("CH_ADDRESS", ""))
+        mail   = _clean(row.get("BM_ADDRESS", ""))
+        city   = _clean(row.get("BM_CITY", ""))
+        zipcode = _clean(row.get("BM_ZIP", ""))
+        state = "NM"
+        if street:
+            parts.append(street)
+        if mail and mail != street:
+            parts.append(f"Mailing: {mail}")
+    else:
+        mail = _clean(row.get("MAILING ADDRESS", ""))
+        city = _clean(row.get("CITY", ""))
+        state = _clean(row.get("ST", "") or row.get("STATE", ""))
+        zipcode = _clean(row.get("ZIP", ""))
+        if mail:
+            parts.append(mail)
     csz = ", ".join(filter(None, [city, state])) + f" {zipcode}".rstrip()
     if csz.strip():
         parts.append(csz.strip())
@@ -574,16 +943,12 @@ def _collect_emails(df: pd.DataFrame) -> list[str]:
     emails: set[str] = set()
     for _, r in df.iterrows():
         lea = _clean(r.get("LEA_TYPE", "")).upper()
-        if lea in {"SC", "LC"}:
-            for col in ("REPRESENTATIVE EMAIL", "CONTACT EMAIL"):
-                e = _clean(r.get(col, ""))
-                if e:
-                    emails.add(e)
-        else:
-            for col in ("SUPT. E-MAIL", "BUS. MGR. E-MAIL"):
-                e = _clean(r.get(col, ""))
-                if e:
-                    emails.add(e)
+        cols = (("CH_ADMIN_EMAIL", "BM_EMAIL") if lea in {"SC", "LC"}
+                else ("SUPT. E-MAIL", "BUS. MGR. E-MAIL"))
+        for col in cols:
+            e = _valid_email(r.get(col, ""))
+            if e:
+                emails.add(e)
     return sorted(emails)
 
 
@@ -625,8 +990,11 @@ if st.sidebar.button("Refresh data"):
 
 try:
     with st.spinner("Loading from Google Sheets…"):
-        raw_assign, raw_dist, raw_chart, raw_overrides, refresh_ts = _fetch_sheets()
+        (raw_assign, raw_dist, raw_directory, raw_busmgr,
+         raw_overrides, load_notes, refresh_ts) = _fetch_sheets()
     st.sidebar.success(f"Loaded — {refresh_ts}")
+    for note in load_notes:
+        st.sidebar.warning(note)
     if len(raw_overrides) > 0:
         st.sidebar.caption(f"{len(raw_overrides)} charter override(s) active")
 except Exception as e:
@@ -634,16 +1002,21 @@ except Exception as e:
     st.stop()
 
 # Prep & merge
-assign  = _prep_assignments(raw_assign.copy())
-dists   = _prep_districts(raw_dist.copy())
-charts  = _prep_charters(raw_chart.copy())
+assign    = _prep_assignments(raw_assign.copy())
+dists     = _prep_districts(raw_dist.copy())
+directory = _prep_charter_directory(raw_directory.copy())
+busmgr    = _prep_charter_busmgr(raw_busmgr.copy())
+
+st.sidebar.caption(
+    f"Charter directory: {len(directory)} rows · Business managers: {len(busmgr)} rows"
+)
 
 with st.sidebar.expander("Charter matching", expanded=False):
     token_cut  = st.slider("Token-set threshold", 80, 100, 92)
     partial_cut = st.slider("Partial threshold",   90, 100, 96)
     strict     = st.checkbox("Exact matches only")
 
-merged, match_log = merge_all(assign, dists, charts, raw_overrides,
+merged, match_log = merge_all(assign, dists, directory, busmgr, raw_overrides,
                               token_cut, partial_cut, strict)
 
 # Filters
@@ -658,6 +1031,8 @@ sel_supers   = st.sidebar.multiselect("Supervisor", all_supers, default=all_supe
 lea_type_opt = st.sidebar.radio(
     "LEA type", ["All", "Districts only", "Charters only"], horizontal=True
 )
+only_unmatched = st.sidebar.checkbox("Only unmatched")
+only_partial   = st.sidebar.checkbox("Only partial (one charter tab missing)")
 
 if st.sidebar.button("Reset filters"):
     for k in ("Analyst", "Supervisor"):
@@ -674,6 +1049,10 @@ if lea_type_opt == "Districts only":
     view = view[view["LEA_TYPE"].apply(_is_district)]
 elif lea_type_opt == "Charters only":
     view = view[view["LEA_TYPE"].apply(_is_charter)]
+if only_unmatched:
+    view = view[~view["Matched"].astype(bool)]
+if only_partial:
+    view = view[view["Partial"].astype(bool)]
 
 # ── Search ───────────────────────────────────────────────────────────
 search = st.text_input("Search", placeholder="Name, PED #, email, city…")
@@ -686,12 +1065,14 @@ if search:
     view = view[mask]
 
 # ── Metrics row ──────────────────────────────────────────────────────
-unmatched_n = int((~view["Matched"]).sum())
-m1, m2, m3, m4 = st.columns(4)
+unmatched_n = int((~view["Matched"].astype(bool)).sum())
+partial_n = int(view["Partial"].astype(bool).sum())
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.markdown(_metric_card("Total LEAs", len(merged)), unsafe_allow_html=True)
 m2.markdown(_metric_card("Showing", len(view)), unsafe_allow_html=True)
-m3.markdown(_metric_card("Matched", int(view["Matched"].sum())), unsafe_allow_html=True)
-m4.markdown(_metric_card("Unmatched", unmatched_n, alert=unmatched_n > 0),
+m3.markdown(_metric_card("Matched", int(view["Matched"].astype(bool).sum())), unsafe_allow_html=True)
+m4.markdown(_metric_card("Partial", partial_n, alert=partial_n > 0), unsafe_allow_html=True)
+m5.markdown(_metric_card("Unmatched", unmatched_n, alert=unmatched_n > 0),
             unsafe_allow_html=True)
 st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
 
@@ -702,10 +1083,10 @@ st.markdown("<div style='height:1.2rem'></div>", unsafe_allow_html=True)
 PAGE_SIZE = 10
 
 if len(view) == 0:
-    st.info("No results match your filters.")
+    st.info("No LEAs match these filters. Clear the search box or reset the filters to start over.")
 else:
     # Build a summary table for browsing
-    summary_cols = ["PED_NO", "LEA_NAME", "LEA_TYPE", "Analyst", "Matched"]
+    summary_cols = ["PED_NO", "LEA_NAME", "LEA_TYPE", "Analyst", "Matched", "Partial"]
     summary = view[[c for c in summary_cols if c in view.columns]].copy()
     summary.index = view.index  # preserve index for lookup
 
@@ -725,10 +1106,16 @@ else:
 
     # Render clickable rows. Streamlit expander labels accept markdown
     # color syntax (:green[]/:red[]) but not custom hex, so the list uses
-    # green/red while the expanded card uses exact brand teal/coral pills.
+    # green/orange/red while the expanded card uses exact brand pills.
     for real_idx, srow in page_df.iterrows():
         matched = bool(srow.get("Matched", False))
-        status = ":green[Matched]" if matched else ":red[Unmatched]"
+        is_partial = bool(srow.get("Partial", False))
+        if matched and is_partial:
+            status = ":orange[Partial]"
+        elif matched:
+            status = ":green[Matched]"
+        else:
+            status = ":red[Unmatched]"
         lea_type_label = "Charter" if _clean(srow.get("LEA_TYPE","")).upper() in {"SC","LC"} else "District"
         label = (
             f"{status}  **{_clean(srow.get('PED_NO',''))}** — "
@@ -799,7 +1186,7 @@ with st.expander("Batch email", expanded=False):
             mailto += f"?subject={urllib.parse.quote(subject)}"
         st.markdown(f"[Open in email client]({mailto})")
     else:
-        st.warning("No email addresses found in selection.")
+        st.warning("No email addresses in this selection. Widen the filters, or check the match log for schools that did not match a charter tab.")
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -809,9 +1196,22 @@ with st.expander("Batch email", expanded=False):
 with st.expander("Data table", expanded=False):
     show_cols = [c for c in [
         "PED_NO", "LEA_NAME", "LEA_TYPE", "Analyst",
-        "Analyst Reports To", "Matched", "match_method", "match_score"
+        "Analyst Reports To", "Matched", "Partial",
+        "CH_ADMIN_NAME", "CH_ADMIN_EMAIL", "BM_NAME", "BM_EMAIL",
+        "CH_STATUS", "match_method",
     ] if c in view.columns]
     st.dataframe(view[show_cols], use_container_width=True, height=400)
+
+with st.expander("Charter match log", expanded=False):
+    if match_log.empty:
+        st.info("No charter rows were processed. Check that both charter tabs loaded.")
+    else:
+        unresolved = match_log[match_log["matched_PED_NO"].eq("")]
+        st.caption(
+            f"{len(match_log)} charter source rows · "
+            f"{len(match_log) - len(unresolved)} matched · {len(unresolved)} unresolved"
+        )
+        st.dataframe(match_log, use_container_width=True, height=340)
 
 st.subheader("Downloads")
 dl1, dl2, dl3 = st.columns(3)
