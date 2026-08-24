@@ -326,6 +326,27 @@ SHEETS = {
     "charter_busmgr":    f"https://docs.google.com/spreadsheets/d/{CHARTER_BOOK}/export?format=csv&gid=352262694",    # Business Managers
 }
 
+def _edit_url(export_url: str) -> str:
+    """Turn a CSV-export URL into one a person can actually open in a browser."""
+    m = re.search(r"/d/([^/]+)/export\?format=csv(?:&gid=(\d+))?", export_url)
+    if not m:
+        return export_url
+    doc, gid = m.group(1), m.group(2) or "0"
+    return f"https://docs.google.com/spreadsheets/d/{doc}/edit#gid={gid}"
+
+
+# Sidebar "Data sources" panel. Owner is recorded because it determines what
+# happens when one breaks: SBB sheets we can fix at source, CSD sheets we can
+# only re-point at.
+SOURCE_INFO = [
+    ("Analyst assignments", "assignments",        "SBB"),
+    ("District contacts",   "districts",          "SBB"),
+    ("Charter directory — All Charter Schools", "charter_directory", "CSD (read-only)"),
+    ("Charter directory — Business Managers",   "charter_busmgr",    "CSD (read-only)"),
+    ("Charter name overrides", "overrides",       "SBB"),
+]
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_sheets():
     """Load every sheet; return (assign, districts, directory, busmgr,
@@ -412,28 +433,38 @@ def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool = False):
 
 
 def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
-    renames = {
-        "PED_NO":     ["PED NO", "ped no", "PED_NO", "Ped No"],
-        "LEA_TYPE":   ["DISTRICT, STATE, OR LOCAL CHARTER", "LEA TYPE", "LEA", "TYPE"],
-        "LEA_NAME":   ["DISTRICT/CHARTER NAME", "LEA NAME", "NAME"],
-        # Same fuzzy-header treatment for the analyst fields, since these
-        # were previously assumed to match verbatim and broke the app the
-        # moment the source sheet's header text shifted at all.
-        "Analyst":            ["Analyst", "Budget Analyst", "ANALYST"],
-        "Analyst Email":      ["Analyst Email", "Analyst E-mail", "ANALYST EMAIL"],
-        # CONFIRMED via screenshot of the live sheet (Jul 2026): the header
-        # was renamed from "Analyst Reports To" -> "Analyst Manager", with
-        # two new sibling columns added alongside it.
-        "Analyst Reports To": ["Analyst Reports To", "Analyst Manager", "Reports To",
+    # Headers are bound MOST SPECIFIC FIRST, and each bound column is removed
+    # from the pool before the next lookup. That ordering is load-bearing:
+    # plain "Analyst" has to be allowed a substring match, because the SBB
+    # sheet annotates the header inline (seen Aug 2026:
+    # "Analyst \n(T)=Temporary Analyst" — a legend, plus a literal newline).
+    # If "Analyst" were resolved first with substring matching on, it would
+    # swallow "Analyst Email"; resolved last against what remains, it can't.
+    ordered = [
+        ("PED_NO",   ["PED NO", "ped no", "PED_NO", "Ped No"], False),
+        ("LEA_TYPE", ["DISTRICT, STATE, OR LOCAL CHARTER", "LEA TYPE", "LEA", "TYPE"], False),
+        ("LEA_NAME", ["DISTRICT/CHARTER NAME", "LEA NAME", "NAME"], False),
+        ("Analyst Manager Email", ["Analyst Manager Email", "ANALYST MANAGER EMAIL"], False),
+        ("Analyst Manager Phone", ["Analyst Manager Phone", "ANALYST MANAGER PHONE"], False),
+        # Renamed upstream Jul 2026 from "Analyst Reports To" -> "Analyst Manager".
+        ("Analyst Reports To", ["Analyst Reports To", "Analyst Manager", "Reports To",
                                 "Supervisor", "Analyst Supervisor", "ANALYST REPORTS TO",
-                                "ANALYST MANAGER"],
-        "Analyst Phone":      ["Analyst Phone", "ANALYST PHONE"],
-        "Analyst Manager Email": ["Analyst Manager Email", "ANALYST MANAGER EMAIL"],
-        "Analyst Manager Phone": ["Analyst Manager Phone", "ANALYST MANAGER PHONE"],
-    }
-    for canon, cands in renames.items():
-        col = _find_col(df, cands)
+                                "ANALYST MANAGER"], False),
+        ("Analyst Email", ["Analyst Email", "Analyst E-mail", "ANALYST EMAIL"], True),
+        ("Analyst Phone", ["Analyst Phone", "ANALYST PHONE"], True),
+        ("Analyst",       ["Analyst", "Budget Analyst", "ANALYST"], True),
+    ]
+    bound_notes: list[str] = []
+    taken: set[str] = set()
+    for canon, cands, contains in ordered:
+        pool = df.drop(columns=[c for c in taken if c in df.columns], errors="ignore")
+        col = _find_col(pool, cands, contains=contains)
         if col:
+            if _hdr_key(col) != _hdr_key(canon):
+                # Header text drifted but still resolved — worth surfacing, since
+                # a silent bind to the wrong column is far worse than a noisy one.
+                bound_notes.append(f"'{canon}' ← {col!r}")
+            taken.add(canon)
             df = df.rename(columns={col: canon})
 
     # Fail loudly and usefully instead of a bare KeyError three screens away.
@@ -449,11 +480,14 @@ def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
                           "Analyst Phone", "Analyst Manager Email", "Analyst Manager Phone"]:
         if optional_col not in df.columns:
             st.sidebar.warning(
-                f"Column '{optional_col}' not found in assignments sheet — "
-                f"filters/cards using it will show blanks. "
-                f"Raw columns: {df.columns.tolist()}"
+                f"Column '{optional_col}' not found in the assignments sheet, so it "
+                f"shows blank everywhere. Usually the column still exists under an "
+                f"edited header — check this list and add the new text to the "
+                f"candidates in _prep_assignments(): {df.columns.tolist()}"
             )
             df[optional_col] = ""
+
+    st.session_state["_assign_header_notes"] = bound_notes
 
     df["PED_NO"]        = df["PED_NO"].apply(ped_canonical)
     df["LEA_TYPE"]      = df["LEA_TYPE"].str.strip().str.upper()
@@ -1010,6 +1044,29 @@ busmgr    = _prep_charter_busmgr(raw_busmgr.copy())
 st.sidebar.caption(
     f"Charter directory: {len(directory)} rows · Business managers: {len(busmgr)} rows"
 )
+
+with st.sidebar.expander("Data sources", expanded=False):
+    row_counts = {
+        "assignments": len(assign),
+        "districts": len(dists),
+        "charter_directory": len(directory),
+        "charter_busmgr": len(busmgr),
+        "overrides": len(raw_overrides),
+    }
+    for label, key, owner in SOURCE_INFO:
+        st.markdown(
+            f"[{label}]({_edit_url(SHEETS[key])})  \n"
+            f"<span style='font-size:11px;color:#8a8a82'>{owner} · "
+            f"{row_counts.get(key, 0)} rows</span>",
+            unsafe_allow_html=True,
+        )
+    st.caption(
+        "CSD owns the charter workbook. If a tab is retired or re-gid'd, update "
+        "the gid in SHEETS at the top of this file."
+    )
+    hdr_notes = st.session_state.get("_assign_header_notes") or []
+    if hdr_notes:
+        st.caption("Headers resolved despite drifted text: " + "; ".join(hdr_notes))
 
 with st.sidebar.expander("Charter matching", expanded=False):
     token_cut  = st.slider("Token-set threshold", 80, 100, 92)
