@@ -1,269 +1,195 @@
 # PED Contacts Manager
 
-**New Mexico PED — School Budget Bureau**
+**New Mexico PED - School Budget Bureau**
 
-Merges the SBB analyst assignment roster with district and charter contact data,
-resolves the naming inconsistencies between those sources, and maps every LEA to
-its assigned budget analyst.
+An intelligent contact management and deduplication tool for school business officials across New Mexico's 216 school districts and charter schools. Merges data from multiple sources, handles name variations, and maps contacts to their assigned analyst.
 
----
+## Overview
 
-## What it does
+This tool solves the challenge of maintaining accurate contact information across a decentralized school system with naming inconsistencies, charter/district reorganizations, and multiple data sources. It:
 
-The bureau's contact data lives in sheets owned by different teams, none of which
-agree on how to spell a school's name, and only one of which carries a PED number.
-This app reconciles them:
-
-1. **Loads** five Google Sheets (assignments, districts, two charter tabs, overrides)
-2. **Normalises** school names — strips editorial notes, punctuation, and boilerplate
-3. **Matches** each charter source to the assignment roster by name, refusing to guess
-   when a name is ambiguous
-4. **Flags** unmatched and partially-matched schools for review
-5. **Provides** search, filtering, and batch email
+1. **Loads** assignment data, district information, and charter school data
+2. **Normalizes** school names and removes duplicates using fuzzy matching
+3. **Maps** contacts to assigned analysts and supervisors
+4. **Identifies** unmatched or problematic records
+5. **Provides** search, filtering, and batch email capabilities
 6. **Exports** clean contact data for Power BI or direct use
 
----
+## Quick Start
 
-## Data sources
-
-All five load live from Google Sheets at runtime — there are no local CSVs and
-no upload step. URLs live in the `SHEETS` dict at the top of
-`Merge_ped_contacts_v2.py`. The sidebar has a **Data sources** panel with a
-clickable link and row count for each.
-
-| Source | Owner | Notes |
-|---|---|---|
-| Analyst assignments | SBB | The spine. The only source carrying `PED_NO`. |
-| District contacts | SBB | Joins on `PED_NO` directly. |
-| Charter directory — *All Charter Schools* | CSD (read-only) | Administrator (charter rep), authorizer, contract term, enrollment cap, grades, phone, street address |
-| Charter directory — *Business Managers* | CSD (read-only) | Business manager name, title, email, phone, mailing address |
-| Charter name overrides | SBB | Manual `charter name → PED_NO` escape hatch |
-
-**The charter workbook belongs to the Charter Schools Division.** We have read
-access only. If CSD retires a tab or changes its `gid`, patch the gid in `SHEETS`
-and move on — the app will keep serving districts in the meantime and will say
-in the sidebar which tab failed to load.
-
-### Why the two charter tabs are matched separately
-
-Neither charter tab has a PED number, so both are name-matched against the
-assignment roster **independently**. Chaining them (business managers → directory
-→ assignments) would compound the error of two fuzzy hops, and a miss in one tab
-would silently suppress the other. Matching each to the spine means one fuzzy hop
-each, and a school can match one tab without the other — which is what the
-**Partial** state means.
-
----
-
-## Quick start
-
+### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
+```
+
+Dependencies include:
+- `streamlit` - Web app framework
+- `pandas` - Data manipulation
+- `rapidfuzz` - Fuzzy string matching
+- `unidecode` - Unicode normalization
+- `pillow` - Image handling for PED logo
+
+### 2. Prepare Your Data
+
+Place three CSV files in the app directory (or upload them when prompted):
+
+- **assignments.csv** - School-to-analyst mappings
+  - Columns: `School_Name`, `Analyst`, `Analyst Reports To` (supervisor)
+  
+- **districts.csv** - Public school district contact data
+  - Columns: `PED_NO`, `District_Name`, `Contact_Name`, `Email`, `Phone`, etc.
+  
+- **charters.csv** - Charter school contact data
+  - Columns: `PED_NO`, `Charter_Name`, `Contact_Name`, `Email`, `Phone`, etc.
+
+### 3. Launch the App
+```bash
 streamlit run Merge_ped_contacts_v2.py
 ```
 
-No data prep required. Use **Refresh data** in the sidebar to clear the one-hour
-cache and re-pull.
-
----
-
-## Matching
-
-### The tiers
-
-Each charter row is resolved in this order, stopping at the first hit:
-
-1. **Override** — the name appears in the overrides sheet. Skips everything else.
-2. **Exact / light** — lightly-normalised name maps to exactly one PED number.
-3. **Squash / light** — as above, once all spacing is removed. Rescues
-   spacing-only differences like `Alma d'Arte` vs `Alma d' arte`.
-4. **Exact / heavy** — heavily-normalised name (or a variant) maps to one PED.
-5. **Squash / heavy**.
-6. **Fuzzy** — `token_set_ratio` then `partial_ratio`, light form first.
-
-Anything unresolved is written to the **Charter match log** with a reason.
-
-### Two-pass normalisation — and why the order matters
-
-`normalize_light()` handles case, diacritics, punctuation, articles, and CSD's
-editorial notes. `normalize_name()` additionally strips boilerplate words:
-*public, charter, school, academy, district, high, prep, learning, center…*
-
-The heavy pass is what lets `(The) ASK Academy` meet `ASK Academy (The)`. But it
-also dissolves the only token separating sibling campuses:
-
-| Roster names | Heavy form |
-|---|---|
-| South Valley Academy / South Valley Preparatory School | `south valley` |
-| Taos Academy / Taos Charter School | `taos` |
-| Albuquerque Charter Academy | `albuquerque` |
-
-Two distinct schools sharing a key means one silently steals the other's match —
-`Albuquerque Charter Academy` collapsing to bare `albuquerque` was swallowing
-`Albuquerque Institute of Mathematics and Science at UNM`. **Matching runs on the
-light form first for exactly this reason**, and falls back to the heavy form only
-for genuinely divergent spellings. Preserve that ordering.
-
-The sidebar **Roster collisions** panel lists roster entries that collapse onto a
-shared heavy key, so these can be spotted before they cause a bad match.
-
-CSD also keeps editorial notes inside the school-name column, which both passes
-strip before matching:
-
-- `(formerly known as X)`, `(CLOSED)`, `(opening 2025-26)` — note-parentheticals removed
-- `(The) ASK Academy` vs `ASK Academy (The)` — parens dropped, articles removed
-- En/em dashes, apostrophes, and punctuation flattened
-- Boilerplate removed: *public, charter, school, academy, district, high, prep, learning, center…*
-
-Status words aren't just discarded — `charter_status()` captures **Closed** /
-**Opening** / **Inactive** and shows them as a badge on the contact card.
-
-### The ambiguity guard — important
-
-Normalisation strips `academy` and `school`, which leaves some names very thin.
-`Explore Academy` normalises to just `explore`, and `token_set_ratio` scores that
-at **100 against all three Explore campuses simultaneously**.
-
-`process.extractOne()` resolves such ties by returning an arbitrary winner. Earlier
-versions of this app did exactly that, which meant a tie could silently attach a
-school's contacts to a sibling campus with full confidence and no warning.
-
-The current code collects **every** roster name sharing the top score and resolves
-them by PED number:
-
-- All tied names point to one PED → accept (they're variants of one school)
-- Tied names span multiple PEDs → **refuse**, and log
-  `ambiguous — 3 schools tied at 100: 557-001, 581-001, 586-001`
-
-Refusals are deliberate. Fix them once in the overrides sheet rather than by
-lowering thresholds. Fuzzy matching is also skipped entirely for normalised names
-under 5 characters, which are too thin to match safely.
-
-### Fan-out guard
-
-If two source rows resolve to the same PED number, only the highest-scoring one is
-kept; the loser is marked `duplicate — another row matched this PED first` in the
-log. Without this, one LEA would appear twice in every export.
-
-### Merged cells
-
-CSD vertically merges the name cell for schools listed with two grade bands — Explore
-Academy Albuquerque spans two rows (K-5 and 6-12). A CSV export writes the merged
-value on the first row only, leaving a nameless orphan row holding half the contact
-data. Rows are stitched back together by forward-filled name, taking the first
-non-empty value in each column.
-
-### Settings (sidebar → Charter matching)
-
-- **Token-set threshold** (80–100, default 92) — higher is stricter
-- **Partial threshold** (90–100, default 96)
-- **Exact matches only** — disables fuzzy entirely; everything else goes to the log
-
----
-
-## Match states
-
-| State | Meaning |
-|---|---|
-| **Matched** | District joined on PED_NO, or charter found in at least one charter tab |
-| **Partial** | Charter found in exactly one of the two charter tabs — half-populated |
-| **Unmatched** | No contact data resolved |
-
-Filter to either **Only unmatched** or **Only partial** in the sidebar.
-
----
+This opens the app in your browser with your contact data pre-loaded.
 
 ## Features
 
-- **Search** — full-text across every field
-- **Filters** — analyst, supervisor, LEA type, unmatched, partial
-- **Contact cards** — analyst, charter rep / superintendent, business manager,
-  charter profile (contract term, enrollment cap, grades), address
-- **Batch email** — by analyst, specific LEAs, or the current filtered view;
-  copy-paste box plus a `mailto:` link
-- **Exports** — filtered results, all contacts, and the match log
+### Smart Name Matching
+- Handles name variations (e.g., "Rio Rancho Public Schools" vs "Rio Rancho Scools" vs "RRPS")
+- Removes common articles and suffixes (the, a, an, school, academy, district, etc.)
+- Ignores punctuation, spacing, and Unicode differences
+- Fuzzy matching with configurable thresholds for ambiguous cases
+- Knows about school reorganizations (e.g., schools formerly known as X)
 
-Email addresses are validated before use. CSD parks prose like *"Please contact CSD"*
-in the email column, and occasionally leaves a trailing comma; neither reaches a
-`mailto:` link.
+### Contact Organization
+- Maps each LEA to its assigned analyst and supervisor
+- Tracks match confidence (exact vs. fuzzy)
+- Flags unmatched schools for manual review
+- Consolidates contact info into single record per LEA
 
----
+### Search & Filtering
+- Full-text search across all contact fields
+- Filter by analyst or supervisor
+- Toggle view to show only unmatched records
+- One-click reset of all filters
 
-## Troubleshooting
+### Batch Email
+- Generate email links for multiple recipients at once
+- Choose by analyst, specific LEAs, or current filtered view
+- Compose subject line and body
+- Copy-paste email addresses or open email client directly
 
-**A charter tab shows 0 rows / a sidebar warning about loading**
-CSD changed the `gid` or retired the tab. Open the workbook via the sidebar
-**Data sources** panel, read the new gid from the URL, update `SHEETS`.
+### Exports
+- **Filtered Results** - Currently visible contacts as CSV
+- **All Contacts** - Complete merged dataset with analyst mappings
+- **Match Log** - Details on how each school was matched, useful for QA
 
-**"Column 'X' not found in the assignments sheet"**
-The column almost certainly still exists under an edited header. Headers drift
-constantly — `Analyst Reports To` became `Analyst Manager` (Jul 2026), and
-`Analyst` became `Analyst \n(T)=Temporary Analyst` (Aug 2026), newline included.
-The warning prints the raw column list; add the new text to the candidate list in
-`_prep_assignments()`.
+## Configuration
 
-Headers are bound **most specific first**, each removed from the pool before the
-next lookup, so plain `Analyst` can safely use substring matching without
-swallowing `Analyst Email`. Preserve that ordering when adding candidates. When a
-header resolves despite drifted text, the Data sources panel notes what bound to what.
+### Matching Settings (Sidebar)
 
-**A school matched to the wrong campus**
-Check the match log for its match method. Add it to the overrides sheet — that's
-faster and safer than adjusting thresholds, which affects every school.
+**Token Set Threshold** (80-100, default 92)
+- Higher = stricter matching, fewer false positives
+- Lower = more lenient, may match unrelated schools
+- Use 95+ for very strict mode
 
-**"duplicate — 5XX-XXX was already claimed by 'Other School'"**
-Two source rows resolved to one PED number. The named winner tells you which.
-Usually either the roster is missing the loser entirely, or the two schools share
-a heavy-normalised key (check the Roster collisions panel).
+**Partial Match Threshold** (90-100, default 96)
+- Controls how close school names must be
+- Higher values require more exact matches
 
-**An acronym won't match its expansion**
-No amount of normalisation bridges `AIMS @ UNM` to `Albuquerque Institute of
-Mathematics and Science at UNM`. That is precisely what the overrides sheet is
-for — add the CSD spelling and the PED number.
+**Strict Mode**
+- When enabled, only exact matches are accepted
+- All fuzzy matches flagged as unmatched for manual review
+- Useful for critical QA passes
 
-**A school won't match at all**
-Look up its reason in the match log. `below threshold` usually means a
-transliteration difference (`Dził Ditł'ooí` vs `Dzit Dit Lool` scores ~92, right at
-the default cut). Either add it to overrides or add a canonical form to
-`_KNOWN_RENAMES`.
+### Data Sources
 
-**Email link doesn't work**
-Some clients cap `mailto:` recipients. Use the copy-paste box instead, and keep
-batches under ~50.
+Toggle between:
+- **Local CSV files** - Pre-bundled CSVs in the app folder (faster, always available)
+- **Upload CSVs** - Upload fresh files each session (useful for testing new data)
 
----
+## How to Use
 
-## File structure
+1. **Start the app** and wait for data to load
+2. **Review metrics** - See total LEAs, matched count, unmatched count
+3. **Filter by analyst or supervisor** using the sidebar
+4. **Search** for specific schools or contacts using the search box
+5. **Select an LEA** from the dropdown to view detailed contact info
+6. **Generate batch emails** if sending notifications to multiple contacts
+7. **Export data** when ready to use in Power BI or send to stakeholders
 
+### Typical Workflows
+
+**Find all unmatched schools:**
+1. Check "Only unmatched" in filters
+2. Review the filtered list
+3. Examine match log to understand why they didn't match
+4. Manually update source data if needed
+
+**Send analyst-wide email:**
+1. Filters → Select specific analyst
+2. Batch Email → By analyst → Choose analyst
+3. Compose subject and body
+4. Click "Generate Email Link"
+5. Opens your email client with all recipients pre-filled
+
+**Export clean data for Power BI:**
+1. Apply any desired filters
+2. Click "⬇️ All Contacts"
+3. CSV downloads with analyst mappings included
+4. Import to Power BI for further analysis
+
+## File Structure
 ```
 ├── Merge_ped_contacts_v2.py       # Main app
 ├── requirements.txt               # Python dependencies
-├── README.md                      # This file
+├── README.md                       # This file
 ├── 300 DPI NM PED Logo JPEG.jpg   # PED branding (optional)
-└── .streamlit/config.toml         # Streamlit config
+├── assignments.csv                # Local data (if bundled)
+├── districts.csv                  # Local data (if bundled)
+└── charters.csv                   # Local data (if bundled)
 ```
 
-Dependencies: `streamlit`, `pandas`, `rapidfuzz`, `unidecode`, `pillow`, `openpyxl`.
+## Troubleshooting
 
----
+**"Some CSV files are missing"**
+- Switch to "Upload CSVs" mode in sidebar if you don't have bundled files
+- Or place assignment, districts, and charters CSVs in the app folder
+
+**Too many/too few matches**
+- Adjust token set and partial match thresholds in Matching Settings
+- Try strict mode to see which records need manual review
+- Check match log to understand the matching logic
+
+**Email link doesn't work**
+- Some email clients don't support `mailto:` links with many recipients
+- Use the "Copy email addresses" option to paste into your email client manually
+- Limit batch emails to under 50-100 recipients if possible
+
+**School name not matching expected school**
+- Check match log—see if it matched to something else
+- Review source data for spelling/formatting issues
+- If the issue persists, add to `KNOWN_RENAMES` dictionary in code
 
 ## Customization
 
-**Colors** — edit the CSS block near the top:
-primary teal `#245d62`, dark teal `#1a474b`, gold `#edc872`, coral `#c64c43`.
-Coral is reserved for the alert/unmatched state; gold is used for hairline dividers.
+### Update PED Branding
+Replace `300 DPI NM PED Logo JPEG.jpg` with your own logo (90px height recommended)
 
-**Known renames** — add stable name reorganisations to `_KNOWN_RENAMES`.
+### Adjust Colors
+Edit the CSS in the `<style>` section to match your organization's colors:
+- Primary: `#245d62` (teal-blue)
+- Secondary: `#c64c43` (coral-red), `#f4784e` (orange), `#edc872` (gold)
 
-**Logo** — replace `300 DPI NM PED Logo JPEG.jpg` (90px height recommended).
+### Known School Renames
+Add common school reorganizations to `KNOWN_RENAMES` dictionary in the code to improve matching accuracy
 
----
+## Integration with Power BI
 
-## Power BI
-
-Export **All contacts**, then Get Data → Text/CSV in Power BI Desktop. Build
-relationships on `PED_NO` or `Analyst`. The export includes match method and score
-columns, so match quality can be audited downstream.
+After exporting "All Contacts":
+1. Open Power BI Desktop
+2. Get Data → Text/CSV
+3. Select the exported CSV
+4. Load into your data model
+5. Create relationships by PED_NO or analyst
+6. Build dashboards on contact distribution, coverage, etc.
 
 ---
 
