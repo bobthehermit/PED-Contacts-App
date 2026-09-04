@@ -60,6 +60,22 @@
 #   phone rather than just a grade band. Those alternates are preserved
 #   instead of being dropped by the collapse.
 
+# Patch (Sep 4 2026): SBB ASSIGNMENTS TAB RESTRUCTURED. The per-row analyst
+#   contact columns (Analyst Email / Phone / Manager / Manager Email) were
+#   removed from the roster and replaced by a small "Contacts" side table
+#   sitting to the right of the roster on the same tab (cols F-J, header on
+#   row 4, one row per analyst). Read as a single CSV, that region has no
+#   header on row 1, so the app saw "Unnamed: 4..9" and warned that every
+#   analyst column was missing.
+#
+#   _split_assignments_tab() now locates the side table by content (a row
+#   containing an "Analyst" cell with "Analyst Email" beside it, preceded by
+#   a blank gap column), carves it off, and _prep_assignments() joins it back
+#   onto the roster by analyst NAME. Multi-analyst cells such as
+#   "Adrianna Benavidez (T)/Lukas Lowery-Ross" resolve each person and join
+#   their details with " / ". If the side table is ever removed and the
+#   inline columns come back, the old inline path still works unchanged.
+
 import re, os, base64, urllib.parse
 from datetime import datetime
 from io import BytesIO
@@ -399,7 +415,11 @@ def _fetch_sheets():
     ts = datetime.now().strftime("%b %d %Y, %I:%M %p")
     notes: list[str] = []
 
-    assign    = pd.read_csv(SHEETS["assignments"], dtype=str).fillna("")
+    # header=None: the assignments tab now holds TWO tables (roster + analyst
+    # contacts side table), so the first row is not a header for the whole
+    # grid. _split_assignments_tab() works out where each one lives.
+    raw_assign = pd.read_csv(SHEETS["assignments"], dtype=str, header=None).fillna("")
+    assign, analyst_contacts = _split_assignments_tab(raw_assign)
     districts = pd.read_csv(SHEETS["districts"],   dtype=str).fillna("")
 
     def _try(key, label):
@@ -435,7 +455,7 @@ def _fetch_sheets():
     except Exception:
         overrides = pd.DataFrame(columns=["CHARTER_NAME", "PED_NO"])
 
-    return assign, districts, directory, overrides, notes, ts
+    return assign, analyst_contacts, districts, directory, overrides, notes, ts
 
 
 # ── Column normalisation helpers ─────────────────────────────────────
@@ -471,7 +491,157 @@ def _find_col(df: pd.DataFrame, candidates: list[str], contains: bool = False):
     return None
 
 
-def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
+def _split_assignments_tab(raw: pd.DataFrame):
+    """Split the raw assignments grid into (roster, analyst_contacts).
+
+    The tab is read with header=None, so `raw` is a plain cell grid with
+    integer column labels. The roster starts at A1 as before. The analyst
+    contacts side table is found by CONTENT, not position: the first cell
+    whose header key is exactly "analyst", with an "analystemail" cell within
+    the next three columns, and a blank cell immediately to its left (the
+    gap column that separates the two tables). Anchoring on content means a
+    future move from F4 to, say, H2 still works.
+
+    Returns the roster with row 0 promoted to headers, and the side table
+    with its own header row promoted — or an empty frame if none was found,
+    in which case _prep_assignments() falls back to the old inline columns.
+    """
+    if raw.empty:
+        return raw, pd.DataFrame()
+
+    hdr_row = start_col = None
+    for r in range(min(len(raw), 60)):
+        row = raw.iloc[r].tolist()
+        for c, cell in enumerate(row):
+            if _hdr_key(cell) != "analyst" or c == 0:
+                continue
+            if _clean(row[c - 1]):
+                continue                       # no gap column: part of the roster
+            nearby = {_hdr_key(x) for x in row[c + 1:c + 4]}
+            if "analystemail" in nearby:
+                hdr_row, start_col = r, c
+                break
+        if hdr_row is not None:
+            break
+
+    if hdr_row is None:
+        # Old layout (or side table not found): row 0 is the whole header.
+        roster = raw.iloc[1:].copy()
+        roster.columns = raw.iloc[0].tolist()
+        roster = roster.loc[:, [bool(_clean(c)) for c in roster.columns]]
+        return roster.reset_index(drop=True), pd.DataFrame()
+
+    # Side table extends right while the header cells stay non-empty…
+    end_col = start_col
+    while end_col + 1 < raw.shape[1] and _clean(raw.iat[hdr_row, end_col + 1]):
+        end_col += 1
+    # …and down until the first blank Analyst cell.
+    body = raw.iloc[hdr_row + 1:, start_col:end_col + 1].copy()
+    body.columns = [_clean(c) for c in raw.iloc[hdr_row, start_col:end_col + 1]]
+    first_col = body.columns[0]
+    stop = body[first_col].map(_clean).eq("")
+    if stop.any():
+        body = body.iloc[: int(stop.to_numpy().argmax())]
+    contacts = body.reset_index(drop=True)
+
+    # Roster: everything left of the side table with a real header in row 0,
+    # keeping only rows that have something in those columns.
+    roster = raw.iloc[1:, :start_col].copy()
+    roster.columns = raw.iloc[0, :start_col].tolist()
+    roster = roster.loc[:, [bool(_clean(c)) for c in roster.columns]]
+    roster = roster[roster.map(_clean).ne("").any(axis=1)]
+    return roster.reset_index(drop=True), contacts
+
+
+def _person_key(s: str) -> str:
+    """Comparison key for an analyst name: diacritics, case, punctuation and
+    the '(T)' temporary marker stripped. 'Sarah Rivera-Benavidez (T)' and
+    'sarah rivera benavidez' collide, which is the point."""
+    s = unidecode(_clean(s)).lower()
+    s = re.sub(r"\(\s*t\s*\)", " ", s)
+    return re.sub(r"[^a-z]", "", s)
+
+
+def _split_people(cell: str) -> list[str]:
+    """'Adrianna Benavidez (T)/Lukas Lowery-Ross' -> both names, in order."""
+    parts = re.split(r"\s*(?:/|&|\band\b|;)\s*", _clean(cell))
+    return [p for p in (re.sub(r"\(\s*t\s*\)", "", p, flags=re.I).strip()
+                        for p in parts) if p]
+
+
+def _attach_analyst_contacts(df: pd.DataFrame, contacts: pd.DataFrame):
+    """Fill Analyst Email / Phone / Reports To / Manager Email on the roster
+    from the side table, keyed on analyst name. Only fills columns the roster
+    does not already carry inline. Returns (df, filled_cols, unresolved)."""
+    if contacts is None or contacts.empty or "Analyst" not in df.columns:
+        return df, [], []
+
+    # Bind the side table's headers with the same tolerance as everything else.
+    spec = [
+        ("Analyst",               ["Analyst", "Analyst Name", "Name"], False),
+        ("Analyst Email",         ["Analyst Email", "Email"], True),
+        ("Analyst Phone",         ["Analyst Phone", "Phone"], True),
+        ("Analyst Manager Email", ["Analyst Manager Email", "Manager Email",
+                                   "Supervisor Email"], True),
+        ("Analyst Manager Phone", ["Analyst Manager Phone", "Manager Phone"], True),
+        ("Analyst Reports To",    ["Analyst Manager", "Analyst Reports To",
+                                   "Manager", "Supervisor", "Reports To"], True),
+    ]
+    ct = contacts.copy()
+    taken: set[str] = set()
+    for canon, cands, contains in spec:
+        pool = ct.drop(columns=[c for c in taken if c in ct.columns], errors="ignore")
+        col = _find_col(pool, cands, contains=contains)
+        if col:
+            taken.add(canon)
+            ct = ct.rename(columns={col: canon})
+    if "Analyst" not in ct.columns:
+        return df, [], []
+
+    fields = [c for c, _, _ in spec[1:] if c in ct.columns and c not in df.columns]
+    if not fields:
+        return df, [], []
+
+    by_key: dict[str, pd.Series] = {}
+    by_last: dict[str, list[pd.Series]] = {}
+    for _, r in ct.iterrows():
+        k = _person_key(r["Analyst"])
+        if not k:
+            continue
+        by_key[k] = r
+        toks = re.findall(r"[a-z]+", unidecode(_clean(r["Analyst"])).lower())
+        if toks:
+            by_last.setdefault(toks[-1], []).append(r)
+
+    unresolved: set[str] = set()
+
+    def _lookup(name: str):
+        r = by_key.get(_person_key(name))
+        if r is not None:
+            return r
+        toks = re.findall(r"[a-z]+", unidecode(name).lower())
+        cands = by_last.get(toks[-1], []) if toks else []
+        if len(cands) == 1:                    # unique surname is good enough
+            return cands[0]
+        unresolved.add(name)
+        return None
+
+    def _resolve(cell: str) -> dict[str, str]:
+        found = [_lookup(n) for n in _split_people(cell)]
+        out = {}
+        for f in fields:
+            vals = [_clean(r.get(f, "")) for r in found if r is not None]
+            out[f] = " / ".join(dict.fromkeys(v for v in vals if v))
+        return out
+
+    resolved = df["Analyst"].map(_resolve)
+    for f in fields:
+        df[f] = resolved.map(lambda d: d.get(f, ""))
+    return df, fields, sorted(unresolved)
+
+
+def _prep_assignments(df: pd.DataFrame,
+                      contacts: pd.DataFrame | None = None) -> pd.DataFrame:
     # Headers are bound MOST SPECIFIC FIRST, and each bound column is removed
     # from the pool before the next lookup. That ordering is load-bearing:
     # plain "Analyst" has to be allowed a substring match, because the SBB
@@ -515,8 +685,14 @@ def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
             f"in the assignments sheet. Raw columns present: {df.columns.tolist()}"
         )
 
+    # Sep 2026: contact details moved to a side table on the same tab. Fill
+    # whatever the roster no longer carries inline from there, by name.
+    df, from_side, unresolved = _attach_analyst_contacts(df, contacts)
+    st.session_state["_assign_side_cols"] = from_side
+    st.session_state["_assign_unresolved"] = unresolved
+
     for optional_col in ["Analyst", "Analyst Email", "Analyst Reports To",
-                          "Analyst Phone", "Analyst Manager Email", "Analyst Manager Phone"]:
+                          "Analyst Phone", "Analyst Manager Email"]:
         if optional_col not in df.columns:
             st.sidebar.warning(
                 f"Column '{optional_col}' not found in the assignments sheet, so it "
@@ -525,6 +701,10 @@ def _prep_assignments(df: pd.DataFrame) -> pd.DataFrame:
                 f"candidates in _prep_assignments(): {df.columns.tolist()}"
             )
             df[optional_col] = ""
+    # Manager phone was dropped from the sheet in Sep 2026; keep the column
+    # for downstream code but don't nag about it.
+    if "Analyst Manager Phone" not in df.columns:
+        df["Analyst Manager Phone"] = ""
 
     st.session_state["_assign_header_notes"] = bound_notes
 
@@ -1206,7 +1386,7 @@ if st.sidebar.button("Refresh data"):
 
 try:
     with st.spinner("Loading from Google Sheets…"):
-        (raw_assign, raw_dist, raw_directory,
+        (raw_assign, raw_contacts, raw_dist, raw_directory,
          raw_overrides, load_notes, refresh_ts) = _fetch_sheets()
     st.sidebar.success(f"Loaded — {refresh_ts}")
     for note in load_notes:
@@ -1218,7 +1398,7 @@ except Exception as e:
     st.stop()
 
 # Prep & merge
-assign    = _prep_assignments(raw_assign.copy())
+assign    = _prep_assignments(raw_assign.copy(), raw_contacts.copy())
 dists     = _prep_districts(raw_dist.copy())
 directory = _prep_charter_directory(raw_directory.copy())
 
@@ -1226,6 +1406,15 @@ _ped_n = int(directory["CH_PED"].map(_clean).ne("").sum()) if len(directory) els
 st.sidebar.caption(
     f"Charter directory: {len(directory)} schools · {_ped_n} with a PED number"
 )
+
+if len(raw_contacts):
+    st.sidebar.caption(f"Analyst contacts: {len(raw_contacts)} analysts in the side table")
+_unres = st.session_state.get("_assign_unresolved") or []
+if _unres:
+    st.sidebar.warning(
+        "Analyst name(s) on the roster with no row in the Contacts side table "
+        "(email/manager left blank): " + "; ".join(_unres)
+    )
 
 with st.sidebar.expander("Data sources", expanded=False):
     row_counts = {
@@ -1248,6 +1437,9 @@ with st.sidebar.expander("Data sources", expanded=False):
     hdr_notes = st.session_state.get("_assign_header_notes") or []
     if hdr_notes:
         st.caption("Headers resolved despite drifted text: " + "; ".join(hdr_notes))
+    side_cols = st.session_state.get("_assign_side_cols") or []
+    if side_cols:
+        st.caption("Filled from the Contacts side table: " + ", ".join(side_cols))
 
 with st.sidebar.expander("Charter matching", expanded=False):
     token_cut  = st.slider("Token-set threshold", 80, 100, 92)

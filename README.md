@@ -29,18 +29,14 @@ Dependencies include:
 - `unidecode` - Unicode normalization
 - `pillow` - Image handling for PED logo
 
-### 2. Prepare Your Data
+### 2. Data Sources
 
-Place three CSV files in the app directory (or upload them when prompted):
+The app reads live from Google Sheets (URLs in `SHEETS` at the top of the script); there are no local CSVs to prepare.
 
-- **assignments.csv** - School-to-analyst mappings
-  - Columns: `School_Name`, `Analyst`, `Analyst Reports To` (supervisor)
-  
-- **districts.csv** - Public school district contact data
-  - Columns: `PED_NO`, `District_Name`, `Contact_Name`, `Email`, `Phone`, etc.
-  
-- **charters.csv** - Charter school contact data
-  - Columns: `PED_NO`, `Charter_Name`, `Contact_Name`, `Email`, `Phone`, etc.
+- **Assignments** (SBB) — the roster, one row per LEA: `PED NO`, `DISTRICT, STATE, OR LOCAL CHARTER`, `DISTRICT/CHARTER NAME`, `Analyst`. As of Sep 2026 the tab also carries a small **Contacts** side table to the right of the roster (currently columns F–J, header on row 4) with one row per analyst: `Analyst`, `Analyst Email`, `Analyst Phone`, `Analyst Manager`, `Analyst Manager Email`. The app finds that table by its headers, not its position, and joins it to the roster by analyst name. Cells like `Adrianna Benavidez (T)/Lukas Lowery-Ross` resolve both people and show their details separated by ` / `.
+- **Districts** (SBB) — district contact data keyed on `PED NO`.
+- **Charter directory** (Charter Schools Division, read-only) — the "All Charter Schools" tab of the NM Charter School Directory workbook. Joined on `PED NO`, with name matching as a fallback.
+- **Overrides** (SBB) — charter name → PED number, for rows the fallback can't resolve.
 
 ### 3. Launch the App
 ```bash
@@ -101,9 +97,7 @@ This opens the app in your browser with your contact data pre-loaded.
 
 ### Data Sources
 
-Toggle between:
-- **Local CSV files** - Pre-bundled CSVs in the app folder (faster, always available)
-- **Upload CSVs** - Upload fresh files each session (useful for testing new data)
+All four sources are Google Sheets, listed with owner and row count in the sidebar's **Data sources** expander. The **Refresh data** button clears the one-hour cache.
 
 ## How to Use
 
@@ -142,16 +136,16 @@ Toggle between:
 ├── requirements.txt               # Python dependencies
 ├── README.md                       # This file
 ├── 300 DPI NM PED Logo JPEG.jpg   # PED branding (optional)
-├── assignments.csv                # Local data (if bundled)
-├── districts.csv                  # Local data (if bundled)
-└── charters.csv                   # Local data (if bundled)
+└── .streamlit/config.toml         # Theme
 ```
 
 ## Troubleshooting
 
-**"Some CSV files are missing"**
-- Switch to "Upload CSVs" mode in sidebar if you don't have bundled files
-- Or place assignment, districts, and charters CSVs in the app folder
+**"Column 'Analyst Email' not found in the assignments sheet" (or similar)**
+- The analyst contact columns live in the Contacts side table on the Assignments tab. The app looks for a header row containing `Analyst` with `Analyst Email` beside it, and a blank column between it and the roster. If the table was renamed or the gap column removed, the app can't see it — check the headers, or add the new header text to the candidates in `_attach_analyst_contacts()`.
+
+**"Analyst name(s) on the roster with no row in the Contacts side table"**
+- The name in the roster's Analyst column doesn't match any name in the Contacts table (after ignoring case, punctuation and the `(T)` marker; a unique surname also matches). Fix the spelling in the sheet.
 
 **Too many/too few matches**
 - Adjust token set and partial match thresholds in Matching Settings
