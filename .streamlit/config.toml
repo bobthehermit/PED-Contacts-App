@@ -5,3 +5,4 @@ backgroundColor = "#ffffff"           # White main canvas
 secondaryBackgroundColor = "#f4f3ef"  # whisper of brand warmth
 textColor = "#1a1a1a"                 # Near-black — softer, more designed than pure #000
 font = "sans serif"
+
